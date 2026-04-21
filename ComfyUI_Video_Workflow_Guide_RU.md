@@ -938,6 +938,164 @@ Gemma — полноценная LLM; фичи, которых у CLIP нет:
 
 ---
 
+## 12. Справочник нод
+
+Этот раздел — компактный лукап по нодам, которые встречаются в §§2–10. Каждая строка таблицы даёт назначение ноды, её основные входы/выходы и виджеты, которые вы реально трогаете. За исчерпывающими per-node страницами (особенно по edge-case виджетам) идите по ссылкам в конце раздела.
+
+**Как читать раздел:**
+- Имена виджетов в нижнем регистре (`cfg`, `sampler_name`) — они совпадают с лейблами ComfyUI UI.
+- «↑» означает «повышение значения →»; «↓» — наоборот. Направления описывают *типичные* эффекты; несколько нод инвертируют их около крайних значений.
+- Значения по умолчанию / рекомендованные предполагают работу с LTX-2.3, если не указано иное.
+
+---
+
+### 12.1 Core loader-ноды
+
+| Нода | Назначение | Ключевые виджеты |
+|------|------------|-------------------|
+| `CheckpointLoaderSimple` | Грузит объединённый чекпойнт (`MODEL + CLIP + VAE`) из `models/checkpoints/`. | `ckpt_name` — файл для загрузки. Других виджетов нет; precision выводится из файла. |
+| `UNETLoader` / `DiffusionModelLoader` | Грузит только denoising backbone. Используется, когда модель поставляется раздельными файлами (LTX-2.3 dev/fp8/nvfp4 чекпойнты работают с этой нодой, если вы отдельно грузите VAE + text encoder). | `unet_name` — файл. `weight_dtype` — `default` / `fp8_e4m3fn` / `fp8_e5m2`. ↓ precision = ↓ VRAM, ↑ риск color shift / бэндинга. |
+| `VAELoader` | Грузит отдельный VAE. | `vae_name` — файл. Видео-VAE включают temporal-ось; не смешивайте с image-only VAE. |
+| `CLIPLoader` / `DualCLIPLoader` | Грузит CLIP / T5-XXL text encoders для SD-family / Wan / Hunyuan / CogVideoX. | `clip_name(_1/_2)`, `type` — должен соответствовать семейству модели (`sdxl`, `flux`, `wan`, и т. д.). **Не использовать для LTX-2.3** — см. `LTXAVTextEncoderLoader` в §12.5. |
+| `UnetLoaderGGUF` (ComfyUI-GGUF) | Грузит GGUF-квантизованные backbones (Q2_K…Q8_0). | `unet_name` — `.gguf` файл. Уровень квантизации запечён внутри; ↓ квант = ↓ VRAM, ↓ точность. |
+| `DualCLIPLoaderGGUF` (ComfyUI-GGUF) | GGUF-квантизованные text encoders, включая Gemma через `type="ltxv"`. | `clip_name_1/2`, `type` — должен быть `ltxv` для LTX-2.3. |
+| `LoraLoader` | Применяет LoRA к `MODEL` + `CLIP`. | `lora_name`, `strength_model` (0–1+), `strength_clip` (0–1+). ↑ strength = сильнее стилистический pull, ↑ риск оверфита/артефактов выше ~1.2. |
+| `LoraLoaderModelOnly` | Применяет LoRA только к `MODEL` (используется LTX — Gemma вне графа LoRA). | `lora_name`, `strength_model`. См. §10.1 по типичным strengths. |
+
+---
+
+### 12.2 Ноды text / image кондиционирования
+
+| Нода | Назначение | Ключевые виджеты |
+|------|------------|-------------------|
+| `CLIPTextEncode` | Кодирует промпт в тензор `CONDITIONING`. | `text` — строка промпта. Всё. Синтаксис усиления (`(word:1.4)`) работает на CLIP, **не на Gemma** — см. §11.1. |
+| `LoadImage` | Грузит картинку из `input/`. | `image` — file picker, кнопка `upload`. Опционально выход `mask`. |
+| `VAEEncode` | Кодирует картинку в латентное пространство. | `pixels`, `vae` — только входы; виджетов нет. Необходимо перед image→latent инъекцией в I2V-графах. |
+| `VAEDecode` | Декодирует latent обратно в пиксели (все кадры за один проход). | `samples`, `vae` — только входы. Высокий VRAM на длинных/HD видео — используйте tiled-вариант ниже. |
+| `VAEDecodeTiled` | Декодирует пространственными + временными тайлами. | `tile_size` (px, пространственный тайл), `overlap` (px, пространственный overlap), `temporal_size` (кадров на тайл), `temporal_overlap` (кадры). LTX-значения см. в §9.8. |
+| `CLIPVisionEncode` | Извлекает semantic image features для IP-Adapter-style гайдинга. | `clip_vision`, `image` — виджетов нет. Выход — *не* первокадровый latent; это style/content эмбеддинг. |
+
+---
+
+### 12.3 Ноды latent и сэмплинга
+
+| Нода | Назначение | Ключевые виджеты |
+|------|------------|-------------------|
+| `EmptyLatentVideo` | Generic empty video latent (используется Wan, Hunyuan, Cog). | `width`, `height`, `length` (кадров), `batch_size`. У каждой оси есть model-specific stride-ограничение. |
+| `KSampler` | Стандартный ComfyUI sampler. Денойзит latent. | `seed`, `steps` (↑ = ↑ качество, ↑ время), `cfg` (prompt adherence; видео-модели часто 1–7), `sampler_name` (алгоритм), `scheduler` (sigma-расписание), `denoise` (0–1; <1 = частичный renoise для I2V/refine). |
+| `KSamplerAdvanced` | KSampler с `start_at_step` / `end_at_step` / `add_noise` — включает two-pass refine, hi-res fix, инъекцию шума. | То же плюс `start_at_step`, `end_at_step`, `return_with_leftover_noise`. |
+| `SamplerCustomAdvanced` | Модульный сэмплер: подаёте `NOISE`, `GUIDER`, `SAMPLER`, `SIGMAS`, `LATENT` отдельно. Используется всеми LTX-2.3 workflow. | Скалярных виджетов нет; конфигурация — это проводка. |
+| `RandomNoise` | Выдаёт noise-тензор для `SamplerCustomAdvanced`. | `noise_seed` — целочисленный сид. Лочьте его во время итераций (§11.9). |
+| `KSamplerSelect` | Выбирает алгоритм шага (выдаёт `SAMPLER`). | `sampler_name` — `euler`, `euler_ancestral`, `dpmpp_2m`, `uni_pc`, `deis`, и т. д. Euler / dpmpp_2m самые безопасные для временной согласованности. |
+| `BasicScheduler` | Выдаёт sigma-расписание. | `scheduler` (`normal`, `karras`, `sgm_uniform`, `beta`, `linear_quadratic`), `steps`, `denoise`. Для LTX замещён `LTXVScheduler`. |
+| `CFGGuider` | Оборачивает модель + pos/neg conditioning в `GUIDER` с одним скаляром `cfg`. | `cfg` — при 1.0 classifier-free guidance отсутствует (используется distilled LTX); поднимайте для более сильной prompt adherence ценой пересыщения. |
+
+---
+
+### 12.4 Ноды вывода / сборки видео
+
+| Нода | Назначение | Ключевые виджеты |
+|------|------------|-------------------|
+| `SaveImage` | Пишет отдельные кадры в `output/`. | `filename_prefix`. |
+| `VHS_VideoCombine` (VideoHelperSuite) | Собирает кадры → MP4 / WEBM / GIF / WebP. | `frame_rate` (должен совпадать с `LTXVConditioning.frame_rate`), `format` (`video/h264-mp4`, `video/h265-mp4`, `image/gif`, …), `pix_fmt` (`yuv420p` для максимальной совместимости), `crf` (↓ = ↑ качество, ↑ размер; 17–23 типично), `save_metadata`, `audio` (опциональный AUDIO вход). |
+| `CreateVideo` | Новая встроенная ComfyUI-альтернатива `VHS_VideoCombine`. | Та же идея; чуть проще набор виджетов. |
+| `VHS_LoadVideo` (VideoHelperSuite) | Грузит видео → image batch + audio. | `video` (файл), `force_rate` (ресемпл fps), `force_size` (ресайз), `frame_load_cap` (макс кадров), `skip_first_frames`, `select_every_nth`. |
+| `GetImageRangeFromBatch` (KJNodes) | Срезает кадры из batch (используется для сшивки / extension в §10.5). | `start_index`, `num_frames`. Отрицательный `start_index` отсчитывает от конца. |
+| `GetVideoComponents` | Разделяет загруженное видео на `IMAGE`, `AUDIO`, `fps`. | Виджетов нет. |
+
+---
+
+### 12.5 LTX-2.3 loaders и кондиционирование
+
+Все требуют `ComfyUI-LTXVideo`.
+
+> **Авторитетный референс для §§12.5–12.8.** За полным актуальным списком виджетов по каждой LTX-2.3 ноде (включая виджеты, опущенные здесь для краткости) идите в официальный репозиторий и reference-воркфлоу:
+> - [`github.com/Lightricks/ComfyUI-LTXVideo`](https://github.com/Lightricks/ComfyUI-LTXVideo) — README ноды-пака.
+> - `custom_nodes/ComfyUI-LTXVideo/example_workflows/2.3/` — поставляемые JSON (`Two_Stage_Distilled`, `Single_Stage_Distilled_Full`, `ICLoRA_Union_Control`, `ICLoRA_Motion_Track`). Эти файлы — ground truth по поводу того, какие виджеты соединены, а какие оставлены в дефолтах.
+> - [`huggingface.co/Lightricks/LTX-2.3`](https://huggingface.co/Lightricks/LTX-2.3) — model card с заметками по conditioning / scheduler.
+
+| Нода | Назначение | Ключевые виджеты |
+|------|------------|-------------------|
+| `LTXAVTextEncoderLoader` | Грузит Gemma 3 12B Instruct (AV-aware text encoder). **Обязательна** вместо `CLIPLoader` для LTX-2.3. | `text_encoder_name` — single consolidated safetensors из `models/text_encoders/`. Не подавайте Git-LFS pointer-файлы (§9.3). |
+| `GemmaAPITextEncode` | Офлоадит кодирование Gemma на API Lightricks — ноль локального Gemma VRAM. | `api_key` (если требуется), `text`. Зависит от сети; не воспроизводимо офлайн. |
+| `LTXVSaveConditioning` | Сериализует закодированный conditioning в `models/embeddings/`. | `filename_prefix`. Запускайте один раз на промпт, дальше пропускаете Gemma на rerun. |
+| `LTXVLoadConditioning` | Перезагружает сохранённый conditioning. | `conditioning_name`. |
+| `EmptyLTXVLatentVideo` | LTX-aware empty video latent (корректный latent-shape для AV DiT). | `width`, `height` (обязаны быть 32-кратны), `length` (обязан быть `8n+1`), `batch_size` (держите 1). |
+| `LTXVEmptyLatentAudio` | Пустой audio-latent в паре с видео-латентом. | `length` — должен быть **≥** длины видео-латента, иначе сэмплинг падает. |
+| `LTXVConcatAVLatent` | Конкатит видео + audio латенты по modality-оси в единый тензор, который ждёт DiT. | Виджетов нет. |
+| `LTXVSeparateAVLatent` | Обратная операция — разбивает выход сэмплера обратно на видео и audio латенты. | Виджетов нет. |
+| `LTXVConditioning` | Штампует frame-rate метадату на conditioning-тензор. | `frame_rate` — должен совпадать с `VHS_VideoCombine.fps` (25 — дефолт из шаблонов). |
+
+---
+
+### 12.6 LTX-2.3 schedulers, guiders, samplers
+
+| Нода | Назначение | Ключевые виджеты |
+|------|------------|-------------------|
+| `LTXVScheduler` | Подтюненное LTX sigma-расписание для полного dev-чекпойнта. | `steps` (20 stage-1, 3–4 stage-2), `max_shift` (2.05; ↑ = больше глобального движения, слабее структура), `base_shift` (0.95; ↑ = более шумная кривая в целом), `stretch` (True оставляет `terminal` как конечную сигму), `terminal` (0.1 оставляет запас для stage-2; ↓ = чище stage-1). Полную таблицу см. в §9.7. |
+| `ManualSigmas` | Хардкодит список сигм. Используется distilled 8-step воркфлоу. | `sigmas` — список float через запятую. Шаблонное distilled-расписание в §9.7. |
+| `MultimodalGuider` | AV-aware guider с per-modality шкалами и STG. **Обязателен** для генерации video+audio. | `scale` (28 в поставляемом шаблоне, трактуется как «CFG-эквивалент»), `skip_block_indices` (список STG-слоёв), `stg_scale`, `rescale`. Дефолты официально не задокументированы — стартуйте от JSON-шаблона. |
+| `STGGuiderAdvanced` | Вариант `MultimodalGuider`, необходимый для `LTXVLoopingSampler`. | Та же идея плюс продвинутые STG-крутилки. |
+| `LTXVNormalizingSampler` | Оборачивает другой `SAMPLER`, предотвращая overbake латента на высоком CFG. | `sampler` (вход). Используйте только на stage-1; пропускайте на inpaint/extend. |
+| `LTXVLoopingSampler` | Temporal-tiling сэмплер для длинных видео. См. §10.5. | `temporal_tile_size` (80), `temporal_overlap` (24), `temporal_overlap_cond_strength` (0.5; ↑ = сильнее непрерывность, ↓ = больше вариативности), `guiding_strength` (вес IC-LoRA per tile), `cond_image_strength`, `horizontal_tiles`, `vertical_tiles`, `spatial_overlap`. |
+
+---
+
+### 12.7 LTX-2.3 image / keyframe кондиционирование
+
+| Нода | Назначение | Ключевые виджеты |
+|------|------------|-------------------|
+| `LTXVPreprocess` | Деградирует входную картинку под training-компрессию. **Без неё выход получается статичный/призрачный** (§9.5). | Виджетов нет. |
+| `LTXVImgToVideoConditionOnly` | First-frame I2V через conditioning-инъекцию (soft anchor). | `conditioning`, `image`, `vae` — скалярных виджетов нет. |
+| `LTXVImgToVideoInplace` | Кодирует картинку и вбивает её в первый латент-кадр (hard anchor). | `strength` (1.0 = полный лок, ↓ = больше drift разрешено). |
+| `LTXVAddGuide` | Soft anchor на произвольном кадре. Строительный блок для FLF2V / FMLF2V. | `frame_idx` (`0` = первый, `-1` = последний), `strength` (1.0 для границ, ~0.5 для внутренних якорей — см. §10.4). |
+| `LTXVAddGuideMulti` (Kijai fork) | Принимает список `(frame_index, image, strength)` кортежей. | Одна строка на якорь; семантика идентична `LTXVAddGuide`. |
+| `LTXVLatentUpsampler` | Stage-2 latent upsampler (нужен чекпойнт spatial-апскейлера). | `upscaler` (вход модели), `scale` (2×). |
+| `LatentUpscaleModelLoader` | Грузит `ltx-2.3-spatial-upscaler-x2-*.safetensors` / temporal upscaler. | `model_name`. |
+| `LTXVCropGuides` | Подрезает guide-латенты обратно до целевого frame count после апскейла. | Виджетов нет (шейпы читает автоматически). |
+| `LTXVTiledVAEDecode` | LTX-специфичный tiled VAE decode. Виджеты в **latent tiles**, не в пикселях (отличается от generic `VAEDecodeTiled`). | `tile_height`, `tile_width`, `overlap`, `force_input_latent`, `decode_method` (`auto`), `upscale_method` (`auto`). Безопасные 12 GB значения в §9.8. |
+| `LTXVAudioVAEDecode` | Декодирует audio-латент в стрим `AUDIO`. | Виджетов нет. |
+
+---
+
+### 12.8 LTX-2.3 IC-LoRA и структурный контроль
+
+| Нода | Назначение | Ключевые виджеты |
+|------|------------|-------------------|
+| `LTXICLoRALoaderModelOnly` | Грузит IC-LoRA и экспонирует её `ref_downscale_factor`. | `lora_name`, `strength_model`. Выходы: `MODEL` и `downscale_factor` — второй подключайте к guide-ноде ниже. |
+| `LTXAddVideoICLoRAGuide` | Присоединяет препроцессенное guide-видео (depth / Canny / pose / motion-track) к conditioning. | `positive` / `negative` (conditioning), `vae`, `guide_video`, `downscale_factor`. |
+| `LTX Add Video IC-LoRA Guide Advanced` | То же плюс пространственное / attention маскирование. | Добавляет `attention_strength`, `attention_mask`. |
+| `LTXVDrawTracks` | Холст-редактор для рисования разрежённых motion-векторов. | Интерактивный виджет. |
+| `LTXVSparseTrackEditor` | Компаньон к `LTXVDrawTracks` — редактирует/уточняет motion-треки. | Интерактивный виджет. |
+
+**Препроцессоры (generic, из `comfyui_controlnet_aux` / `ComfyUI-VideoDepthAnything`):**
+
+| Нода | Производит | Ключевые виджеты |
+|------|------------|-------------------|
+| `VideoDepthAnythingProcess` + `LoadVideoDepthAnythingModel` | Depth-видео для IC-LoRA Union. | Вариант модели (`vits`, `vitb`, `vitl`), входное разрешение. |
+| `CannyEdgePreprocessor` | Canny-edge видео. | `low_threshold` (↓ = больше рёбер, больше шума), `high_threshold`. |
+| `DWPreprocessor` | OpenPose skeleton-видео. | `detect_hand`, `detect_body`, `detect_face`. |
+| `ResizeImageMaskNode` (KJNodes) | Ресайзит image/mask под latent. | `width`, `height`, `upscale_method`. |
+
+---
+
+### 12.9 Куда смотреть, когда этой таблицы недостаточно
+
+Для полной per-widget документации, нюансов взаимодействия и новых нод, не покрытых здесь:
+
+- **Core ComfyUI ноды**: встроенный список нод на `http://127.0.0.1:8188/` → ПКМ → `Help`, или ComfyUI wiki (`docs.comfy.org`).
+- **LTX-2.3 ноды**: `custom_nodes/ComfyUI-LTXVideo/README.md` и поставляемые workflow JSON в `example_workflows/2.3/` — эти JSON самые авторитетные по поводу того, какие виджеты ожидаются подключёнными, а какие оставлены в дефолтах.
+- **VideoHelperSuite**: README `github.com/Kosinkadink/ComfyUI-VideoHelperSuite`.
+- **ComfyUI-GGUF**: `github.com/city96/ComfyUI-GGUF`.
+- **KJNodes**: `github.com/kijai/ComfyUI-KJNodes`.
+- **controlnet_aux препроцессоры**: `github.com/Fannovel16/comfyui_controlnet_aux`.
+- **RIFE / frame interpolation**: `github.com/Fannovel16/ComfyUI-Frame-Interpolation`.
+- **Advanced-ControlNet**: `github.com/Kosinkadink/ComfyUI-Advanced-ControlNet`.
+
+Когда эффект виджета не очевиден из имени, быстрее всего **зафиксировать сид, изменить один виджет крупным шагом, перерендерить на 512×384 / 49 кадров** (§11.9). Большинство виджетов раскрывают своё направление за две итерации.
+
+---
+
 *Это руководство покрывает универсальные строительные блоки. У каждой конкретной модели будут свои loader-ноды, нюансы кондиционирования и оптимальные настройки — но общая структура остаётся той же. §9–§11 демонстрируют, как пайплайн отображается на реальную audio+video модель (LTX-2.3), включая её продвинутые LoRA и keyframe-управления, и её Gemma-based грамматику промптинга.*
 
 Для паттернов сторителлинга и продакшна поверх этого пайплайна (shot lists, репликация стиля, character consistency, рецепты по типам шотов, постпродакшн и более глубокая прокачка промптов) см. сопутствующую серию `animation_course_RU/`.
