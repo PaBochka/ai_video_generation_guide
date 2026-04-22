@@ -476,11 +476,18 @@ LoadImage ──▶ LTXVPreprocess ──▶ LTXVImgToVideoInplace (strength=1.0
 
 ### 9.7 Sampler / scheduler пресеты
 
+**Сначала термины.** «Distilled» — это **режим семплинга** (мало шагов + `CFGGuider cfg=1.0` + активная distilled-LoRA), **а не** выбор шедулера. Он появляется в двух поставляемых шаблонах, которые ведут себя по-разному:
+
+- **`Single_Stage_Distilled_Full.json`** — distilled-режим на весь рендер. Использует `ManualSigmas` (8 хардкоженных sigmas), который **заменяет** `LTXVScheduler`.
+- **`Two_Stage_Distilled.json`** — `LTXVScheduler` в **обеих** стадиях. Stage 1 — это полный 20-шаговый dev-проход, заканчивающийся на `terminal=0.1`; stage 2 запускает distilled-режим (3–4 шага, CFG=1, distilled-LoRA включена) на 2×-апскейленном латенте, чтобы доделать оставшиеся ~10% денойза. `ManualSigmas` здесь **не** используется — `LTXVScheduler` просто запускается с меньшим числом шагов.
+
+Правильная ментальная модель: distilled-режим — это *быстрый примитив доочистки*. Запускайте его standalone (single stage, `ManualSigmas`) для скорости или как stage 2 (`LTXVScheduler`, 3–4 шага) после полноценной stage 1.
+
 | Стадия | Шаги | CFG | Sampler | Заметки |
 |-------|-------|-----|---------|-------|
 | Dev, stage 1 | 20 (до 25–35) | 4.0 (диапазон 2–5) на `MultimodalGuider` (или `scale=28` по шаблону) | `euler` / `euler_ancestral` | `LTXVScheduler` + `LTXVNormalizingSampler` |
-| Dev, stage 2 (upsample) | 3–4 | 1.0 (`CFGGuider`) | `euler` | `LTXVScheduler` |
-| Distilled (single stage) | 8 | 1.0 (`CFGGuider`) | `euler` | `ManualSigmas` (см. ниже), без `LTXVScheduler` |
+| Dev, stage 2 (upsample, distilled-режим) | 3–4 | 1.0 (`CFGGuider`) | `euler` | `LTXVScheduler` (короткий прогон), distilled-LoRA активна |
+| Single-stage distilled | 8 | 1.0 (`CFGGuider`) | `euler` | `ManualSigmas` (см. ниже), заменяет `LTXVScheduler` |
 
 **Значение параметров `LTXVScheduler`:**
 
@@ -491,7 +498,7 @@ LoadImage ──▶ LTXVPreprocess ──▶ LTXVImgToVideoInplace (strength=1.0
 | `stretch` | True | Если True, перешкаливает sigmas так, чтобы расписание заканчивалось на `terminal` вместо ~0 |
 | `terminal` | 0.1 | Sigma отсечения; denoising останавливается здесь, оставляя запас для stage-2. Ниже = чище stage-1; выше = больше запаса деталей |
 
-**Distilled-воркфлоу использует `ManualSigmas` вместо `LTXVScheduler`.** Поставленный 2.3 single-stage distilled JSON хардкодит:
+**Single-stage distilled-воркфлоу использует `ManualSigmas` вместо `LTXVScheduler`** (two-stage distilled оставляет `LTXVScheduler` в обеих стадиях — см. заметку о терминологии в начале раздела). Поставленный 2.3 single-stage distilled JSON хардкодит:
 
 ```
 sigmas = "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"

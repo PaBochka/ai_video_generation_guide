@@ -476,11 +476,18 @@ For longer than ~10s use `LTXVLoopingSampler` (§10.5) — VRAM grows roughly li
 
 ### 9.7 Sampler / scheduler presets
 
+**Terminology first.** "Distilled" is a **sampling mode** — few steps + `CFGGuider cfg=1.0` + distilled LoRA active — **not** a scheduler. It appears in two shipped templates, which behave differently:
+
+- **`Single_Stage_Distilled_Full.json`** — distilled mode for the whole render. Uses `ManualSigmas` (8 hard-coded sigmas), which **replaces** `LTXVScheduler`.
+- **`Two_Stage_Distilled.json`** — `LTXVScheduler` in **both** stages. Stage 1 is the full 20-step dev pass ending at `terminal=0.1`; stage 2 runs the distilled mode (3–4 steps, CFG=1, distilled LoRA on) on the 2×-upscaled latent to finish the remaining ~10% of denoise. `ManualSigmas` is **not** used here — `LTXVScheduler` just runs for fewer steps.
+
+So the right mental model is: distilled mode is a *fast refinement primitive*. Run it standalone (single stage, `ManualSigmas`) for speed, or as stage 2 (`LTXVScheduler`, 3–4 steps) after a full-quality stage 1.
+
 | Stage | Steps | CFG | Sampler | Notes |
 |-------|-------|-----|---------|-------|
 | Dev, stage 1 | 20 (up to 25–35) | 4.0 (range 2–5) on `MultimodalGuider` (or `scale=28` per template) | `euler` / `euler_ancestral` | `LTXVScheduler` + `LTXVNormalizingSampler` |
-| Dev, stage 2 (upsample) | 3–4 | 1.0 (`CFGGuider`) | `euler` | `LTXVScheduler` |
-| Distilled (single stage) | 8 | 1.0 (`CFGGuider`) | `euler` | `ManualSigmas` (see below), no `LTXVScheduler` |
+| Dev, stage 2 (upsample, distilled mode) | 3–4 | 1.0 (`CFGGuider`) | `euler` | `LTXVScheduler` (short run), distilled LoRA active |
+| Single-stage distilled | 8 | 1.0 (`CFGGuider`) | `euler` | `ManualSigmas` (see below), replaces `LTXVScheduler` |
 
 **`LTXVScheduler` parameter meaning:**
 
@@ -491,7 +498,7 @@ For longer than ~10s use `LTXVLoopingSampler` (§10.5) — VRAM grows roughly li
 | `stretch` | True | If True, rescales sigmas so the schedule terminates at `terminal` instead of ~0 |
 | `terminal` | 0.1 | Cutoff sigma; denoising stops here, leaving headroom for stage-2 refinement. Lower = cleaner stage-1; higher = more detail headroom |
 
-**Distilled workflow uses `ManualSigmas` instead of `LTXVScheduler`.** The shipped 2.3 single-stage distilled JSON hard-codes:
+**The single-stage distilled workflow uses `ManualSigmas` instead of `LTXVScheduler`** (two-stage distilled keeps `LTXVScheduler` in both stages — see the terminology note at the start of this section). The shipped 2.3 single-stage distilled JSON hard-codes:
 
 ```
 sigmas = "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
