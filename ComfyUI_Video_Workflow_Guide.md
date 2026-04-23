@@ -958,57 +958,213 @@ This section is a compact lookup for the nodes that appear in §§2–10. Each t
 
 ### 12.1 Core loader nodes
 
-| Node | Purpose | Key widgets |
-|------|---------|-------------|
-| `CheckpointLoaderSimple` | Loads a combined checkpoint (`MODEL + CLIP + VAE`) from `models/checkpoints/`. | `ckpt_name` — file to load. No other widgets; precision is inferred from the file. |
-| `UNETLoader` / `DiffusionModelLoader` | Loads only the denoising backbone. Used when the model ships as separate files (LTX-2.3 dev/fp8/nvfp4 checkpoints work with this when you also load VAE + text encoder separately). | `unet_name` — file. `weight_dtype` — `default` / `fp8_e4m3fn` / `fp8_e5m2`. ↓ precision = ↓ VRAM, ↑ risk of color shift / banding. |
-| `VAELoader` | Loads a standalone VAE. | `vae_name` — file. Video VAEs include a temporal axis; do not mix with image-only VAEs. |
-| `CLIPLoader` / `DualCLIPLoader` | Loads CLIP / T5-XXL text encoders for SD-family / Wan / Hunyuan / CogVideoX. | `clip_name(_1/_2)`, `type` — must match the model family (`sdxl`, `flux`, `wan`, etc.). **Do not use for LTX-2.3** — see `LTXAVTextEncoderLoader` in §12.5. |
-| `UnetLoaderGGUF` (ComfyUI-GGUF) | Loads GGUF-quantized backbones (Q2_K…Q8_0). | `unet_name` — `.gguf` file. Quant level is baked in; ↓ quant = ↓ VRAM, ↓ fidelity. |
-| `DualCLIPLoaderGGUF` (ComfyUI-GGUF) | GGUF-quantized text encoders, including Gemma via `type="ltxv"`. | `clip_name_1/2`, `type` — must be `ltxv` for LTX-2.3. |
-| `LoraLoader` | Applies a LoRA to `MODEL` + `CLIP`. | `lora_name`, `strength_model` (0–1+), `strength_clip` (0–1+). ↑ strength = stronger stylistic pull, ↑ risk of overfitting/artifacts past ~1.2. |
-| `LoraLoaderModelOnly` | Applies a LoRA only to `MODEL` (used by LTX — Gemma is outside the LoRA graph). | `lora_name`, `strength_model`. See §10.1 for typical strengths. |
+#### `CheckpointLoaderSimple`
+
+**What it does.** Loads a combined checkpoint (`MODEL` + `CLIP` + `VAE`) from `models/checkpoints/` into VRAM.
+**Why it's needed.** Most SD-family and packaged video models ship all three components in one `.safetensors` file — this node is how those weights enter the graph. Without it (or the separate-file alternatives below), there is no model to denoise with.
+**Effect on video.** The *choice* of checkpoint is the single biggest factor in the output: it determines visual style, motion vocabulary, trained resolution, aspect-ratio sweet spot, and maximum frame count. The node itself has no output-shaping widgets — precision is baked into the file.
+**Widgets.** `ckpt_name` — file to load.
+
+#### `UNETLoader` / `DiffusionModelLoader`
+
+**What it does.** Loads only the denoising backbone (UNet or DiT). VAE and text encoder must be loaded separately.
+**Why it's needed.** Most modern video checkpoints (LTX-2.3 dev/fp8/nvfp4, HunyuanVideo, Wan) ship the backbone, VAE, and text encoder as *separate* files so you can mix precisions (e.g., FP8 backbone + BF16 VAE). A `CheckpointLoaderSimple` cannot read these split files.
+**Effect on video.** `weight_dtype` trades VRAM against fidelity: `fp8_e4m3fn` / `fp8_e5m2` roughly halves VRAM vs. `default` (BF16), at the cost of subtle color shifts, mild banding, and occasional detail loss — usually imperceptible on short clips, more visible on long renders with smooth gradients.
+**Widgets.** `unet_name`; `weight_dtype` — `default` / `fp8_e4m3fn` / `fp8_e5m2`.
+
+#### `VAELoader`
+
+**What it does.** Loads a standalone Variational Autoencoder — the component that translates between pixels and latent space.
+**Why it's needed.** Video VAEs are **3D-aware** (they encode/decode along the temporal axis too). If you load an image-only VAE by mistake, or mix a VAE from a different model family, decoding produces black frames, colored noise, or violent flicker. Split-file checkpoints need this node because the VAE lives in its own `.safetensors`.
+**Effect on video.** VAE choice controls final color fidelity, how cleanly fine detail decodes, and how much temporal flicker is present. Mismatched VAEs are a common cause of "the output looks broken but the sampler succeeded".
+**Widgets.** `vae_name`.
+
+#### `CLIPLoader` / `DualCLIPLoader`
+
+**What it does.** Loads one or two CLIP / T5-XXL text encoders and exposes them as a `CLIP` input.
+**Why it's needed.** SD-family, Wan, HunyuanVideo, CogVideoX, and Flux all use CLIP or CLIP+T5 to turn prompts into conditioning tensors. Without a matching encoder the prompt never reaches the model. **Do not use for LTX-2.3** — LTX's Gemma 3 encoder has a different tokenizer and hidden-state size, and `CLIPLoader` silently produces garbage conditioning (see §9.3 and `LTXAVTextEncoderLoader` in §12.5).
+**Effect on video.** Tokenizer/encoder mismatch → gibberish output or wrong subject entirely. Matched correctly, the encoder choice mostly affects prompt adherence fidelity, not raw visual quality.
+**Widgets.** `clip_name(_1/_2)`; `type` — must match the model family (`sdxl`, `flux`, `wan`, etc.).
+
+#### `UnetLoaderGGUF` (ComfyUI-GGUF)
+
+**What it does.** Loads GGUF-quantized backbones (Q2_K…Q8_0) — extreme-compression formats borrowed from llama.cpp.
+**Why it's needed.** LTX-2.3 22B at BF16 is 46 GB — impossible on a 12–16 GB card. GGUF quantization shrinks that to 8–25 GB with manageable quality loss, putting the model on consumer hardware that otherwise couldn't run it at all.
+**Effect on video.** ↓ quant level (Q2_K, Q3_K) → drastically lower VRAM, visibly softer/smudged detail and mild color shifts; Q8_0 is nearly lossless vs. BF16 but still ~60% the size. For character-consistency-critical shots, use Q6_K or higher.
+**Widgets.** `unet_name` — the `.gguf` file. Quant level is baked into the file.
+
+#### `DualCLIPLoaderGGUF` (ComfyUI-GGUF)
+
+**What it does.** Loads GGUF-quantized text encoders, including Gemma 3 for LTX-2.3 via `type="ltxv"`.
+**Why it's needed.** Gemma 3 12B FP8 is 13 GB; GGUF-quantized it drops to 4–8 GB, which matters when running LTX-2.3 at ≤16 GB total VRAM. This node is the GGUF equivalent of `LTXAVTextEncoderLoader` — the generic GGUF CLIP loader will not load Gemma correctly without `type="ltxv"`.
+**Effect on video.** Low-bit Gemma (Q3/Q4) → prompt adherence degrades slightly (subtle elements of long prompts get dropped); visual output is otherwise unchanged because the backbone still denoises at full precision.
+**Widgets.** `clip_name_1/2`; `type` — must be `ltxv` for LTX-2.3.
+
+#### `LoraLoader`
+
+**What it does.** Applies a LoRA (Low-Rank Adaptation) to both `MODEL` and `CLIP`, injecting style / subject / motion biases without replacing the base weights.
+**Why it's needed.** LoRAs are the standard way to specialize a model — style, specific characters, motion patterns, camera behavior — without retraining or swapping checkpoints. Stacking lets you combine a style LoRA with a motion LoRA in the same render.
+**Effect on video.** `strength_model ↑` → stronger stylistic pull on the image/motion; past ~1.2, you get overfitting artifacts (warped anatomy, color saturation, repeating textures). `strength_clip` controls how strongly the LoRA influences prompt interpretation — usually match `strength_model`, but drop `strength_clip` to 0 if the LoRA distorts prompts.
+**Widgets.** `lora_name`; `strength_model` (0–1+); `strength_clip` (0–1+).
+
+#### `LoraLoaderModelOnly`
+
+**What it does.** Applies a LoRA only to `MODEL` (not CLIP). This is the LoRA loader for **LTX-2.3** and other models where the text encoder sits outside the LoRA graph.
+**Why it's needed.** LTX-2.3's Gemma encoder is not part of the LoRA-patchable weights — the LoRAs were trained against the DiT backbone only. Feeding a Gemma-less LoRA through `LoraLoader` (which also patches CLIP) silently breaks prompt behavior. All LTX LoRAs — distilled-speed, camera-control, style — must go through this node.
+**Effect on video.** Identical strength behavior to `LoraLoader` but applies only to motion / visual / style biases. See §10.1 for per-category strength recommendations (distilled: 0.2–0.5; camera: 0.5–0.8; style: ≤0.6).
+**Widgets.** `lora_name`; `strength_model`.
 
 ---
 
 ### 12.2 Text / image conditioning nodes
 
-| Node | Purpose | Key widgets |
-|------|---------|-------------|
-| `CLIPTextEncode` | Encodes a prompt into a `CONDITIONING` tensor. | `text` — the prompt string. That's it. Emphasis syntax (`(word:1.4)`) works on CLIP, **not Gemma** — see §11.1. |
-| `LoadImage` | Loads an image from `input/`. | `image` — file picker, `upload` button. Optional `mask` output. |
-| `VAEEncode` | Encodes an image to latent space. | `pixels`, `vae` — inputs only; no widgets. Required before image→latent injection in I2V graphs. |
-| `VAEDecode` | Decodes latent back to pixels (all frames in one pass). | `samples`, `vae` — inputs only. High VRAM on long/HD videos — use tiled variant below. |
-| `VAEDecodeTiled` | Decodes in spatial + temporal tiles. | `tile_size` (px, spatial tile), `overlap` (px, spatial overlap), `temporal_size` (frames per tile), `temporal_overlap` (frames). See §9.8 for LTX values. |
-| `CLIPVisionEncode` | Extracts semantic image features for IP-Adapter-style guidance. | `clip_vision`, `image` — no widgets. Output is *not* a first-frame latent; it's a style/content embedding. |
+#### `CLIPTextEncode`
+
+**What it does.** Encodes a prompt string into a `CONDITIONING` tensor the sampler can consume.
+**Why it's needed.** The model denoises in response to a conditioning tensor, not raw text — this node is how your prompt actually reaches the sampler. You use it twice per workflow: once for the positive prompt (what you want) and once for the negative (what to avoid).
+**Effect on video.** Prompt quality is the main driver of output content, subject, composition, and motion. On CLIP, emphasis syntax `(word:1.4)` boosts a token's weight; on Gemma (LTX-2.3) this syntax is ignored (§11.1) — emphasize by repetition, specificity, and paragraph order instead.
+**Widgets.** `text` — the prompt string.
+
+#### `LoadImage`
+
+**What it does.** Loads an image from `input/` into the graph as an `IMAGE` tensor (and optionally a `MASK`).
+**Why it's needed.** Every image-to-video, keyframe, or IC-LoRA workflow starts with this node — it's the entry point for reference stills. For FLF2V you'll have two or three `LoadImage` nodes, one per anchor.
+**Effect on video.** The input image's resolution, aspect ratio, and content anchor what the model generates. Feeding an image whose aspect ratio doesn't match the latent target → distortion at encode time. Always resize to the model's trained resolution before encoding (see `ResizeImageMaskNode` in §12.8).
+**Widgets.** `image` — file picker + `upload` button. Optional `mask` output.
+
+#### `VAEEncode`
+
+**What it does.** Encodes a pixel-space image into a latent tensor using the VAE — the inverse of `VAEDecode`.
+**Why it's needed.** Samplers operate in latent space, not pixel space. Any reference image that needs to be *blended into the latent* (hard anchors, first-frame injection, inpainting) must first be encoded here. I2V workflows that only pass the image as *conditioning* (`LTXVImgToVideoConditionOnly`) skip this.
+**Effect on video.** Encoding must use the **matching** VAE — a VAE from a different model family silently produces wrong latents and the sampler outputs noise or black. No shaping widgets.
+**Widgets.** `pixels`, `vae` — inputs only.
+
+#### `VAEDecode`
+
+**What it does.** Decodes a denoised latent back into pixel-space frames — the last step before you have viewable images.
+**Why it's needed.** The sampler's output is a compressed latent; you can't play or export it directly. This is the bridge from latent to RGB frames.
+**Effect on video.** Decoding is where VAE mismatches reveal themselves (flicker, color banding, black frames). For long or HD video, this node's VRAM spike can OOM even when sampling succeeded — switch to `VAEDecodeTiled` / `LTXVTiledVAEDecode` in that case.
+**Widgets.** `samples`, `vae` — inputs only.
+
+#### `VAEDecodeTiled`
+
+**What it does.** Same as `VAEDecode` but processes the latent in **spatial and temporal tiles**, keeping only one tile in VRAM at a time.
+**Why it's needed.** Video VAE decoding is the most memory-intensive stage of the pipeline. A 1280×720×97-frame latent can blow past 24 GB on plain `VAEDecode`. Tiled decoding trades time for VRAM — essential on 12–16 GB cards.
+**Effect on video.** Tiled decode can leave faint **seam artifacts** at tile boundaries. `overlap ↑` → softer seams, more VRAM/time. `tile_size ↓` → lower VRAM, slower, more visible seams. `temporal_size` controls how many frames decode per temporal tile — match to a multiple of the VAE's temporal stride to avoid flicker at tile edges. See §9.8 for LTX-safe values.
+**Widgets.** `tile_size` (px, spatial tile), `overlap` (px, spatial overlap), `temporal_size` (frames per tile), `temporal_overlap` (frames).
+
+#### `CLIPVisionEncode`
+
+**What it does.** Passes an image through a CLIP Vision encoder to extract a **semantic embedding** — a high-level description of what the image contains — rather than a pixel-level latent.
+**Why it's needed.** For IP-Adapter / style-transfer workflows where you want the model to pick up *content and style* from a reference without locking the exact pixels in as frame 0. Think "make the video in the same mood as this photo" rather than "start the video with this photo".
+**Effect on video.** Output is a conditioning embedding, not a latent. It biases subject appearance, palette, and composition across all frames — but does not force any specific first frame.
+**Widgets.** `clip_vision`, `image` — no widgets.
 
 ---
 
 ### 12.3 Latent and sampling nodes
 
-| Node | Purpose | Key widgets |
-|------|---------|-------------|
-| `EmptyLatentVideo` | Generic empty video latent (used by Wan, Hunyuan, Cog). | `width`, `height`, `length` (frames), `batch_size`. Each dim has a model-specific stride constraint. |
-| `KSampler` | Standard ComfyUI sampler. Denoises a latent. | `seed`, `steps` (↑ = ↑ quality, ↑ time), `cfg` (prompt adherence; video models often 1–7), `sampler_name` (algorithm), `scheduler` (sigma schedule), `denoise` (0–1; <1 = partial renoise for I2V/refine). |
-| `KSamplerAdvanced` | KSampler with `start_at_step` / `end_at_step` / `add_noise` — enables two-pass refine, hi-res fix, noise injection. | Same as above plus `start_at_step`, `end_at_step`, `return_with_leftover_noise`. |
-| `SamplerCustomAdvanced` | Modular sampler: plug in `NOISE`, `GUIDER`, `SAMPLER`, `SIGMAS`, `LATENT` separately. Used by all LTX-2.3 workflows. | No scalar widgets; wiring is the configuration. |
-| `RandomNoise` | Emits noise tensor for `SamplerCustomAdvanced`. | `noise_seed` — integer seed. Lock this during iteration (§11.9). |
-| `KSamplerSelect` | Picks the stepping algorithm (outputs a `SAMPLER`). | `sampler_name` — `euler`, `euler_ancestral`, `dpmpp_2m`, `uni_pc`, `deis`, etc. Euler / dpmpp_2m are safest for temporal consistency. |
-| `BasicScheduler` | Emits a sigma schedule. | `scheduler` (`normal`, `karras`, `sgm_uniform`, `beta`, `linear_quadratic`), `steps`, `denoise`. Superseded by `LTXVScheduler` for LTX work. |
-| `CFGGuider` | Wraps a model + pos/neg conditioning into a `GUIDER` with one scalar `cfg`. | `cfg` — at 1.0 there is no classifier-free guidance (used by distilled LTX); raise for stronger prompt adherence at the cost of saturation. |
+#### `EmptyLatentVideo`
+
+**What it does.** Creates an empty latent "canvas" shaped `[batch, channels, frames, height, width]` — the blank tensor the sampler will fill.
+**Why it's needed.** The sampler needs a latent to denoise; this defines its dimensions. Used by Wan, HunyuanVideo, CogVideoX. **Not** for LTX-2.3 — use `EmptyLTXVLatentVideo` + audio pair (§12.5) because LTX expects an AV-concatenated latent.
+**Effect on video.** `width`/`height` = output resolution; `length` = frame count. Each model has stride rules (multiples of 8, 16, 32) and a max trained frame count — breaking them causes shape errors or artifacts. Doubling any dim roughly quadruples sampling VRAM.
+**Widgets.** `width`, `height`, `length` (frames), `batch_size`.
+
+#### `KSampler`
+
+**What it does.** The standard ComfyUI denoising loop — takes a latent full of noise and iteratively cleans it toward the conditioning target.
+**Why it's needed.** This is the engine that actually generates video. Works with any model that plugs into ComfyUI's standard interface (most SD-family and older video models).
+**Effect on video.** `steps ↑` → more refinement, higher quality, linearly slower; diminishing returns past ~30 for most video models. `cfg ↑` → stronger prompt adherence, risk of oversaturation/warping past model's sweet spot (video models usually 1–7). `denoise < 1.0` keeps some of the input latent's signal — this is how I2V and refine passes work; at 1.0 the sampler ignores the input latent entirely. `sampler_name` changes stepping algorithm; `scheduler` changes the sigma curve (Euler + normal is a safe default).
+**Widgets.** `seed`, `steps`, `cfg`, `sampler_name`, `scheduler`, `denoise`.
+
+#### `KSamplerAdvanced`
+
+**What it does.** `KSampler` with extra step-range controls — start and end the denoise at arbitrary steps, optionally leave leftover noise for a second pass.
+**Why it's needed.** Two-pass refine (low-res → upscale latent → finish denoising), hi-res fix, noise injection mid-denoise — all require starting/stopping the sampler at specific steps and handing the partial latent to another sampler.
+**Effect on video.** `start_at_step` / `end_at_step` split the denoise curve into stages — useful for stage-1/stage-2 pipelines without switching to `SamplerCustomAdvanced`. `return_with_leftover_noise=True` leaves the latent "unfinished" for the next pass to continue.
+**Widgets.** All `KSampler` widgets plus `start_at_step`, `end_at_step`, `add_noise`, `return_with_leftover_noise`.
+
+#### `SamplerCustomAdvanced`
+
+**What it does.** A **modular** sampler — instead of bundled widgets, you wire in the pieces separately: `NOISE` source, `GUIDER` (model+conditioning), `SAMPLER` (algorithm), `SIGMAS` (schedule), and the `LATENT`.
+**Why it's needed.** LTX-2.3 needs non-standard combinations (custom guiders, `ManualSigmas`, AV-concatenated latents) that don't fit inside the monolithic `KSampler`. All shipped LTX-2.3 workflows use this.
+**Effect on video.** None from the node itself — everything is delegated to the inputs. The advantage is that each piece can be swapped independently: try `ManualSigmas` vs `LTXVScheduler` without touching anything else.
+**Widgets.** None — wiring is the configuration.
+
+#### `RandomNoise`
+
+**What it does.** Emits a noise tensor seeded by `noise_seed`. Feeds the `NOISE` input of `SamplerCustomAdvanced`.
+**Why it's needed.** Denoising starts from pure noise; this is where that noise comes from. The seed makes the render **reproducible** — same seed + same graph = same output.
+**Effect on video.** Changing the seed changes everything that isn't pinned by the prompt or anchors. **Lock the seed** during prompt iteration (§11.9); changing prompt and seed simultaneously gives no signal about which change caused the difference.
+**Widgets.** `noise_seed` — integer.
+
+#### `KSamplerSelect`
+
+**What it does.** Picks the stepping algorithm and outputs it as a `SAMPLER` object for `SamplerCustomAdvanced`.
+**Why it's needed.** The algorithm determines how the sampler walks from noise to clean latent. Different algorithms converge differently — some are stable but plain, others creative but flickery.
+**Effect on video.** For video, temporal consistency (no flicker) matters as much as image quality. `euler` and `dpmpp_2m` are the safest defaults — smooth motion, predictable. `euler_ancestral` injects extra noise per step → more creative, more flicker. `uni_pc` / `deis` are fast but sometimes unstable on video. LTX-2.3 templates all ship with `euler`.
+**Widgets.** `sampler_name`.
+
+#### `BasicScheduler`
+
+**What it does.** Generates a sigma schedule — the noise-level curve the sampler walks down.
+**Why it's needed.** Many models expect a specific schedule shape. Wrong schedule → over- or under-denoised output.
+**Effect on video.** `karras` → front-loads detail (sharper). `sgm_uniform` → cleaner convergence for SD-family. `linear_quadratic` → matches flow-matching models more closely than `normal`. For LTX-2.3 use `LTXVScheduler` instead — it's tuned for the model's shifted flow-matching schedule.
+**Widgets.** `scheduler`, `steps`, `denoise`.
+
+#### `CFGGuider`
+
+**What it does.** Wraps model + positive + negative conditioning into a `GUIDER` with a single `cfg` scalar — classifier-free guidance strength.
+**Why it's needed.** `SamplerCustomAdvanced` needs a `GUIDER` input; `CFGGuider` is the simplest one. It applies standard CFG: bigger `cfg` → sampler pushes harder toward positive conditioning and away from negative.
+**Effect on video.** `cfg = 1.0` → no classifier-free guidance (no difference between positive and negative) — this is what **distilled** LTX-2.3 uses, because the distilled LoRA was trained to work without CFG. `cfg > 1.0` → stronger prompt adherence, risk of oversaturation / contrast crushing (especially on flow-matching models). For LTX-2.3 AV generation use `MultimodalGuider` instead (§12.6).
+**Widgets.** `cfg`.
 
 ---
 
 ### 12.4 Output / video assembly nodes
 
-| Node | Purpose | Key widgets |
-|------|---------|-------------|
-| `SaveImage` | Writes individual frames to `output/`. | `filename_prefix`. |
-| `VHS_VideoCombine` (VideoHelperSuite) | Assembles frames → MP4 / WEBM / GIF / WebP. | `frame_rate` (must match `LTXVConditioning.frame_rate`), `format` (`video/h264-mp4`, `video/h265-mp4`, `image/gif`, …), `pix_fmt` (`yuv420p` for max compatibility), `crf` (↓ = ↑ quality, ↑ size; 17–23 is typical), `save_metadata`, `audio` (optional AUDIO input). |
-| `CreateVideo` | Newer built-in ComfyUI alternative to `VHS_VideoCombine`. | Same idea; slightly simpler widget set. |
-| `VHS_LoadVideo` (VideoHelperSuite) | Loads a video → image batch + audio. | `video` (file), `force_rate` (resample fps), `force_size` (resize), `frame_load_cap` (max frames), `skip_first_frames`, `select_every_nth`. |
-| `GetImageRangeFromBatch` (KJNodes) | Slices frames from a batch (used for stitching / extension in §10.5). | `start_index`, `num_frames`. Negative `start_index` counts from the end. |
-| `GetVideoComponents` | Splits a loaded video into `IMAGE`, `AUDIO`, `fps`. | No widgets. |
+#### `SaveImage`
+
+**What it does.** Writes individual frames to `output/` as numbered PNGs.
+**Why it's needed.** For external editing workflows — export frames, bring into DaVinci / After Effects / FFmpeg, finish there. Also useful for debugging a single frame from a long render.
+**Effect on video.** None on content; affects only what reaches disk. Frames are saved lossless (PNG).
+**Widgets.** `filename_prefix`.
+
+#### `VHS_VideoCombine` (VideoHelperSuite)
+
+**What it does.** Assembles a batch of frames (+ optional audio) into a playable video file — MP4, WEBM, GIF, or WebP.
+**Why it's needed.** The model outputs a batch of still images; this is how you turn them into a video your OS / browser / player actually plays. Most-used export node in the ecosystem.
+**Effect on video.** `frame_rate` must match `LTXVConditioning.frame_rate` — mismatched fps makes motion look sped-up or slowed-down relative to what the model generated. `format` chooses container/codec (H.264 MP4 = most compatible; H.265 = smaller file, less support; GIF = quick previews, limited colors). `pix_fmt` — use `yuv420p` for maximum compatibility (some players reject 10-bit / 4:4:4). `crf ↓` → higher quality, larger file; 17–23 is a good range. `audio` input is where LTX-2.3's `AUDIO` output connects.
+**Widgets.** `frame_rate`, `format`, `pix_fmt`, `crf`, `save_metadata`, `audio` (optional).
+
+#### `CreateVideo`
+
+**What it does.** ComfyUI's newer built-in alternative to `VHS_VideoCombine` — same purpose, fewer widgets.
+**Why it's needed.** Works without installing VideoHelperSuite; fine for simple MP4 exports. VHS is still more flexible (more codec/format options, richer audio handling).
+**Effect on video.** Same parameters govern playback speed and file size. Less granular control over codec/container specifics.
+**Widgets.** Simpler subset of `VHS_VideoCombine`.
+
+#### `VHS_LoadVideo` (VideoHelperSuite)
+
+**What it does.** Reads a video file and outputs an `IMAGE` batch + `AUDIO`. The inverse of `VHS_VideoCombine`.
+**Why it's needed.** Video-to-video workflows, IC-LoRA guide videos (depth/Canny/pose references), extension workflows that need to pull the last frames of a prior clip.
+**Effect on video.** `force_rate` resamples to a target fps during load — use to match your generation fps. `force_size` resizes frames. `frame_load_cap` limits how many frames load (memory saver). `skip_first_frames` + `select_every_nth` let you sample a long video sparsely — useful when feeding guide videos to IC-LoRAs.
+**Widgets.** `video`, `force_rate`, `force_size`, `frame_load_cap`, `skip_first_frames`, `select_every_nth`.
+
+#### `GetImageRangeFromBatch` (KJNodes)
+
+**What it does.** Slices a contiguous range of frames out of an `IMAGE` batch.
+**Why it's needed.** Video extension (§10.5): grab the last N frames of clip A to feed as anchors for clip B. Also for discarding intro/outro frames before export.
+**Effect on video.** No quality impact; controls which frames survive. `start_index = -N` counts N frames from the end — the canonical way to grab a "tail" for stitching.
+**Widgets.** `start_index`, `num_frames`.
+
+#### `GetVideoComponents`
+
+**What it does.** Splits a loaded video into separate `IMAGE` batch, `AUDIO` stream, and `fps` number.
+**Why it's needed.** Downstream nodes (IC-LoRA preprocessors, audio passthrough) usually want these separately. Reading them from `VHS_LoadVideo` and then splitting via this node is the standard pattern.
+**Effect on video.** None — pure re-routing.
+**Widgets.** None.
 
 ---
 
@@ -1021,68 +1177,257 @@ All of these require `ComfyUI-LTXVideo`.
 > - `custom_nodes/ComfyUI-LTXVideo/example_workflows/2.3/` — shipped JSONs (`Two_Stage_Distilled`, `Single_Stage_Distilled_Full`, `ICLoRA_Union_Control`, `ICLoRA_Motion_Track`). These are the ground truth for which widgets are wired vs. left at defaults.
 > - [`huggingface.co/Lightricks/LTX-2.3`](https://huggingface.co/Lightricks/LTX-2.3) — model card with conditioning / scheduler notes.
 
-| Node | Purpose | Key widgets |
-|------|---------|-------------|
-| `LTXAVTextEncoderLoader` | Loads Gemma 3 12B Instruct (AV-aware text encoder). **Required** instead of `CLIPLoader` for LTX-2.3. | `text_encoder_name` — single consolidated safetensors from `models/text_encoders/`. Do not feed Git-LFS pointer files (§9.3). |
-| `GemmaAPITextEncode` | Offloads Gemma encoding to Lightricks' API — zero local Gemma VRAM. | `api_key` (if required), `text`. Depends on network; not reproducible offline. |
-| `LTXVSaveConditioning` | Serializes encoded conditioning to `models/embeddings/`. | `filename_prefix`. Run once per prompt, then skip Gemma on reruns. |
-| `LTXVLoadConditioning` | Reloads saved conditioning. | `conditioning_name`. |
-| `EmptyLTXVLatentVideo` | LTX-aware empty video latent (correct latent shape for the AV DiT). | `width`, `height` (must be 32-multiple), `length` (must be `8n+1`), `batch_size` (keep at 1). |
-| `LTXVEmptyLatentAudio` | Empty audio latent paired with the video latent. | `length` — must be **≥** video latent length, or sampling fails. |
-| `LTXVConcatAVLatent` | Concatenates video + audio latents along the modality axis into the single tensor the DiT expects. | No widgets. |
-| `LTXVSeparateAVLatent` | Inverse of the above — splits sampler output back into video + audio latents. | No widgets. |
-| `LTXVConditioning` | Stamps frame-rate metadata onto the conditioning tensor. | `frame_rate` — must match `VHS_VideoCombine.fps` (25 is the shipped default). |
+#### `LTXAVTextEncoderLoader`
+
+**What it does.** Loads Gemma 3 12B Instruct — LTX-2.3's AV-aware text encoder — and exposes it as a `CLIP` input.
+**Why it's needed.** Gemma 3 is a full 12B decoder LLM with its own tokenizer, projection, and hidden-state dimensions. The generic `CLIPLoader` / `DualCLIPLoader` can't correctly load it — it silently fails or produces shape errors at the DiT. **Required** instead of `CLIPLoader` for LTX-2.3. Always load a single consolidated safetensors; never Git-LFS pointer files (tokenizer assets end up missing — §9.3).
+**Effect on video.** Wrong loader → gibberish video or empty output. Correct loader → prompt adherence is excellent even for paragraph-length prompts (Gemma handles long context well).
+**Widgets.** `text_encoder_name` — single consolidated safetensors from `models/text_encoders/`.
+
+#### `GemmaAPITextEncode`
+
+**What it does.** Sends the prompt to Lightricks' API, returns the encoded conditioning — no local Gemma needed.
+**Why it's needed.** Gemma 3 12B occupies 9.5–13 GB of VRAM locally. On ≤12 GB cards, encoding Gemma locally crowds out the backbone; this node moves that cost to Lightricks' servers.
+**Effect on video.** Identical conditioning quality to local Gemma. Downsides: requires network connectivity, is not reproducible offline, and adds ~1–3s latency per prompt.
+**Widgets.** `api_key` (if required), `text`.
+
+#### `LTXVSaveConditioning`
+
+**What it does.** Serializes an encoded `CONDITIONING` tensor to `models/embeddings/` as a `.safetensors` file.
+**Why it's needed.** Gemma encoding is expensive (multi-second, gigabytes of VRAM). If you iterate on the **same prompt** across many seeds / resolutions / LoRA strengths, you encode Gemma once and reuse the cached result — saving minutes of compute per iteration session.
+**Effect on video.** None on quality. Massive speedup on iterative workflows.
+**Widgets.** `filename_prefix`.
+
+#### `LTXVLoadConditioning`
+
+**What it does.** Reloads a previously-saved conditioning tensor — the inverse of `LTXVSaveConditioning`.
+**Why it's needed.** Lets you skip `LTXAVTextEncoderLoader` + `CLIPTextEncode` entirely on reruns. Drops Gemma from VRAM on the second+ render, freeing memory for higher resolution / more frames.
+**Effect on video.** None on quality; frees Gemma's VRAM cost.
+**Widgets.** `conditioning_name`.
+
+#### `EmptyLTXVLatentVideo`
+
+**What it does.** Creates an empty video latent **shaped for LTX-2.3's AV-aware DiT** — not the same shape as `EmptyLatentVideo`.
+**Why it's needed.** LTX-2.3 denoises video and audio together, so the video latent must have the exact stride and channel layout the DiT expects. Feeding a generic `EmptyLatentVideo` here → shape-mismatch error at the sampler ("4 vs 3", etc.).
+**Effect on video.** Defines the output resolution and frame count. Must obey LTX's constraints: `width % 32 == 0`, `height % 32 == 0`, `length = 8n + 1`. Breaking these → sampler error. Higher resolution and more frames scale VRAM and time roughly linearly per dimension.
+**Widgets.** `width`, `height`, `length`, `batch_size` (keep at 1).
+
+#### `LTXVEmptyLatentAudio`
+
+**What it does.** Creates an empty audio latent that pairs with the video latent.
+**Why it's needed.** LTX-2.3 always samples video + audio together — even for silent output. If audio latent is missing or **shorter** than the video latent, sampling fails.
+**Effect on video.** For silent output, use defaults and leave the prompt without sound cues — the model will generate ambient quiet. For driven audio (e.g., when you want audio to match a specific duration), `length` must be **≥** video latent length.
+**Widgets.** `length`.
+
+#### `LTXVConcatAVLatent`
+
+**What it does.** Concatenates the video and audio latents along the modality axis into the single tensor the DiT ingests.
+**Why it's needed.** The DiT has one latent input with both modalities stacked. This node builds that tensor. Without it → wrong input shape → sampler error.
+**Effect on video.** None on content; pure plumbing. Must be present in every LTX-2.3 sampling graph.
+**Widgets.** None.
+
+#### `LTXVSeparateAVLatent`
+
+**What it does.** Splits the sampler's output latent back into separate video and audio latents — inverse of `LTXVConcatAVLatent`.
+**Why it's needed.** The decoders are modality-specific: `LTXVTiledVAEDecode` wants the video latent, `LTXVAudioVAEDecode` wants the audio latent. You can't feed the concatenated tensor to either.
+**Effect on video.** None on content; routes the two streams to their respective decoders.
+**Widgets.** None.
+
+#### `LTXVConditioning`
+
+**What it does.** Stamps frame-rate metadata onto the conditioning tensor so the model knows at what fps to generate motion.
+**Why it's needed.** LTX-2.3 was trained with per-clip fps information — it generates different motion pacing at 24 vs 25 vs 30 fps. Without this node, the model defaults to something that may not match your export fps.
+**Effect on video.** `frame_rate` controls the **tempo** of motion the model generates. **Must match** `VHS_VideoCombine.fps` — a mismatch makes motion look too fast or too slow on playback. 25 is the shipped default; 24 for cinematic, 30 for smoother motion.
+**Widgets.** `frame_rate`.
 
 ---
 
 ### 12.6 LTX-2.3 schedulers, guiders, samplers
 
-| Node | Purpose | Key widgets |
-|------|---------|-------------|
-| `LTXVScheduler` | LTX's tuned sigma schedule for the full dev checkpoint. | `steps` (20 stage-1, 3–4 stage-2), `max_shift` (2.05; ↑ = more global motion, looser structure), `base_shift` (0.95; ↑ = noisier overall curve), `stretch` (True keeps `terminal` as the end sigma), `terminal` (0.1 leaves headroom for stage-2; ↓ = cleaner stage-1). See §9.7 for the full table. |
-| `ManualSigmas` | Hard-codes a sigma list. Used by the distilled 8-step workflow. | `sigmas` — comma-separated floats. The shipped distilled schedule is in §9.7. |
-| `MultimodalGuider` | AV-aware guider with per-modality scales and STG. **Required** for video+audio generation. | `scale` (28 in the shipped template, treat as "CFG-equivalent"), `skip_block_indices` (STG layer list), `stg_scale`, `rescale`. Defaults aren't officially documented — start from the JSON template. |
-| `STGGuiderAdvanced` | Variant of `MultimodalGuider` required by `LTXVLoopingSampler`. | Same idea plus advanced STG knobs. |
-| `LTXVNormalizingSampler` | Wraps another `SAMPLER` to prevent latent overbake at high CFG. | `sampler` (input). Use on stage-1 only; skip on inpaint/extend. |
-| `LTXVLoopingSampler` | Temporal-tiling sampler for long videos. See §10.5. | `temporal_tile_size` (80), `temporal_overlap` (24), `temporal_overlap_cond_strength` (0.5; ↑ = stronger continuity, ↓ = more variation), `guiding_strength` (IC-LoRA weight per tile), `cond_image_strength`, `horizontal_tiles`, `vertical_tiles`, `spatial_overlap`. |
+#### `LTXVScheduler`
+
+**What it does.** Emits the sigma schedule (noise-level curve the sampler walks down) tuned specifically for LTX-2.3's flow-matching DiT.
+**Why it's needed.** LTX-2.3 is trained on a *shifted* flow-matching schedule — not the DDPM-style schedules `BasicScheduler` produces. Feeding a generic schedule → model denoises at the wrong rate → blurry, undercooked, oversaturated, or broken frames. Used in both stages of the two-stage workflow (§9.7).
+**Effect on video.** `max_shift ↑` → curve pushes toward noisier start → stronger global motion, looser spatial structure. `base_shift ↑` → curve tilts to noisier overall (more chaotic detail). `stretch=True` lets the schedule terminate at `terminal` instead of ~0 — this is what leaves room for stage 2. `terminal ↑` → more "undone" noise left for a stage-2 refine pass; `↓` → cleaner standalone render but no stage-2 headroom.
+**Widgets.** `steps` (20 stage-1, 3–4 stage-2), `max_shift` (2.05), `base_shift` (0.95), `stretch` (True), `terminal` (0.1). Full table in §9.7.
+
+#### `ManualSigmas`
+
+**What it does.** Hard-codes a fixed list of sigmas — a literal noise schedule — instead of generating one algorithmically.
+**Why it's needed.** The **single-stage distilled** LTX-2.3 workflow was trained against a *specific* 8-point sigma schedule. The distilled LoRA expects exactly those values — using `LTXVScheduler` instead produces the wrong noise trajectory, and the distilled LoRA fights the sampler, giving muddy / broken output. `ManualSigmas` pins the schedule to the exact values the LoRA was trained with. **Only used in single-stage distilled mode;** the two-stage distilled workflow keeps `LTXVScheduler` in both stages.
+**Effect on video.** With the shipped values (`1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0`), you get the canonical 8-step distilled render — fast (~8s on a 4090) and clean. Shorter sigma lists → even faster but coarser motion and softer detail. Longer lists → diminishing returns; the distilled LoRA saturates above ~12 steps.
+**Widgets.** `sigmas` — comma-separated floats.
+
+#### `MultimodalGuider`
+
+**What it does.** Wraps model + positive + negative conditioning into a `GUIDER` with **separate guidance scales** for video and audio, plus STG (Spatio-Temporal Guidance).
+**Why it's needed.** LTX-2.3 denoises both modalities in one pass, but the optimal guidance differs per modality. A plain `CFGGuider` applies one scalar to both — either under-guiding audio or over-cooking video. **Required** for any AV generation in LTX-2.3.
+**Effect on video.** `scale` is the main "CFG-equivalent" knob — the shipped template uses 28; ↑ past ~32 → oversaturation, contrast crushing, warping. `skip_block_indices` selects which DiT layers STG perturbs (STG works by slightly corrupting internal layers to force the model to denoise more coherently). `stg_scale ↑` → stronger temporal coherence (less flicker) but less motion variety. `rescale` counteracts latent energy drift at high scales.
+**Widgets.** `scale`, `skip_block_indices`, `stg_scale`, `rescale`.
+
+#### `STGGuiderAdvanced`
+
+**What it does.** An extended `MultimodalGuider` with finer STG control, **required** by `LTXVLoopingSampler`.
+**Why it's needed.** The looping sampler walks the latent in temporal tiles and needs STG parameters exposed at a more granular level than the plain guider. Feeding a plain `MultimodalGuider` → type/interface errors.
+**Effect on video.** Same knobs as `MultimodalGuider` plus advanced STG levers — these primarily affect **seam quality between temporal tiles** (how well neighboring tiles stitch together without visible flicker).
+**Widgets.** Superset of `MultimodalGuider`.
+
+#### `LTXVNormalizingSampler`
+
+**What it does.** A sampler *wrapper* — takes another `SAMPLER` as input and normalizes the latent between denoise steps to prevent intensity overbake.
+**Why it's needed.** At high CFG / `scale` values, LTX-2.3's latent accumulates magnitude across denoise steps, and the final output looks crushed — oversaturated, halos around highlights, black-point clipping. Normalization bleeds that accumulated intensity back on each step, keeping colors and contrast natural.
+**Effect on video.** On stage 1 → more natural color and contrast, especially at `scale ≥ 28`. **Do not use** on inpaint / extend workflows — the normalization interferes with the continuity constraint between adjacent clips and creates visible seams.
+**Widgets.** `sampler` (input).
+
+#### `LTXVLoopingSampler`
+
+**What it does.** Generates long video by sampling it in **temporal tiles** — chunks of frames that overlap and stitch together — instead of denoising the whole clip at once.
+**Why it's needed.** VRAM scales roughly linearly with frame count. Past ~10s at 25 fps (~250 frames) single-shot denoising OOMs on consumer GPUs. Temporal tiling keeps peak VRAM near a single tile's worth, enabling 10–30 second clips on 24 GB cards.
+**Effect on video.** `temporal_tile_size ↑` → fewer seams, higher VRAM and per-tile cost. `temporal_overlap ↑` → smoother transitions between tiles, slower (more redundant denoising). `temporal_overlap_cond_strength ↑ (→ 0.7)` → stronger continuity (reduces motion drift across tiles); `↓ (→ 0.3)` → more variation tile-to-tile (useful for shots that legitimately evolve). `guiding_strength` → how strongly IC-LoRA guides each tile. `horizontal_tiles` / `vertical_tiles > 1` enable spatial tiling for very high resolution.
+**Widgets.** `temporal_tile_size` (80), `temporal_overlap` (24), `temporal_overlap_cond_strength` (0.5), `guiding_strength` (1.0), `cond_image_strength` (1.0), `horizontal_tiles` / `vertical_tiles` (1), `spatial_overlap` (1).
 
 ---
 
 ### 12.7 LTX-2.3 image / keyframe conditioning
 
-| Node | Purpose | Key widgets |
-|------|---------|-------------|
-| `LTXVPreprocess` | Degrades input image to match training compression. **Omitting it produces static/ghostly output** (§9.5). | No widgets. |
-| `LTXVImgToVideoConditionOnly` | First-frame I2V via conditioning injection (soft anchor). | `conditioning`, `image`, `vae` — no scalar widgets. |
-| `LTXVImgToVideoInplace` | Encodes image and blends it into the first latent frame (hard anchor). | `strength` (1.0 = full lock, ↓ = more drift allowed). |
-| `LTXVAddGuide` | Soft anchor at an arbitrary frame. Building block for FLF2V / FMLF2V. | `frame_idx` (`0` = first, `-1` = last), `strength` (1.0 for boundaries, ~0.5 for interior anchors — see §10.4). |
-| `LTXVAddGuideMulti` (Kijai fork) | Accepts a list of `(frame_index, image, strength)` tuples. | One row per anchor; identical semantics to `LTXVAddGuide`. |
-| `LTXVLatentUpsampler` | Stage-2 latent upsampler (needs the spatial upscaler checkpoint). | `upscaler` (model input), `scale` (2×). |
-| `LatentUpscaleModelLoader` | Loads `ltx-2.3-spatial-upscaler-x2-*.safetensors` / temporal upscaler. | `model_name`. |
-| `LTXVCropGuides` | Trims guide latents back to target frame count after upscaling. | No widgets (reads shapes automatically). |
-| `LTXVTiledVAEDecode` | LTX-specific tiled VAE decode. Widgets are in **latent tiles**, not pixels (differs from the generic `VAEDecodeTiled`). | `tile_height`, `tile_width`, `overlap`, `force_input_latent`, `decode_method` (`auto`), `upscale_method` (`auto`). Safe 12 GB values in §9.8. |
-| `LTXVAudioVAEDecode` | Decodes the audio latent into an `AUDIO` stream. | No widgets. |
+#### `LTXVPreprocess`
+
+**What it does.** Applies a deliberate degradation (compression + subtle noise) to the input image to match the compression statistics of LTX-2.3's training data.
+**Why it's needed.** LTX-2.3 was trained on *compressed* frames (from real video codecs). Feeding a pristine sharp image confuses the model — it sees a distribution it never trained on. **Skipping this node produces near-static or ghostly I2V output** — one of the most common LTX-2.3 bugs.
+**Effect on video.** With preprocessing → the model happily animates the input image. Without it → the input sits frozen on screen for most of the clip, or the video becomes ghostly/blurry. No knobs to tune.
+**Widgets.** None.
+
+#### `LTXVImgToVideoConditionOnly`
+
+**What it does.** Injects a preprocessed image into the conditioning as a **soft first-frame anchor**. The model is told "start here" but is free to negotiate the exact first frame.
+**Why it's needed.** The default I2V mode — simpler than `LTXVImgToVideoInplace`, faster to set up, more forgiving when the input image doesn't exactly match target resolution.
+**Effect on video.** First frame closely resembles the input but isn't pixel-identical. Motion is fluid because the model isn't locked in. Best for "animate this photo" use cases.
+**Widgets.** `conditioning`, `image`, `vae` — no scalar widgets.
+
+#### `LTXVImgToVideoInplace`
+
+**What it does.** VAE-encodes the image and **blends it directly into the first frame of the latent** — a hard anchor. The sampler is forced to reconstruct exactly that input.
+**Why it's needed.** When you need the first frame to match pixel-for-pixel (e.g., matching a previous clip's last frame for extension, or locking in a specific portrait).
+**Effect on video.** `strength = 1.0` → first frame matches the input exactly; motion fluidity may suffer because the model has less freedom. `strength ↓` → more drift allowed → smoother motion but first frame may subtly differ from input. For extension workflows (stitching clips), use 1.0.
+**Widgets.** `strength`.
+
+#### `LTXVAddGuide`
+
+**What it does.** Places a **soft anchor image** at an arbitrary frame index in the clip. The building block for multi-keyframe I2V (FLF2V, FMLF2V, arbitrary keyframes).
+**Why it's needed.** There is no dedicated first-last-frame node in LTX-2.3; you compose it from two `LTXVAddGuide` calls (`frame_idx=0` + `frame_idx=-1`). For three or more anchors, chain additional calls.
+**Effect on video.** `frame_idx` picks where the anchor lands (`0` = first, `-1` = last, any integer = specific frame). `strength = 1.0` → anchor is rigid (use for boundary frames); `strength ≈ 0.5` → soft anchor (use for **interior** frames, which need wiggle room to avoid visible snaps). Too-high interior strength → "snap" pop at that frame. Too-low → middle anchor drifts / is ignored. Start interior at 0.5 (§10.4).
+**Widgets.** `frame_idx`, `strength`.
+
+#### `LTXVAddGuideMulti` (Kijai fork)
+
+**What it does.** Same behavior as `LTXVAddGuide` but accepts a **list of anchors** `(frame_index, image, strength)` in one node instead of chaining N copies.
+**Why it's needed.** Cleaner graphs when you have 3+ anchor frames. Functionally identical to chaining `LTXVAddGuide` — just less spaghetti.
+**Effect on video.** Identical to chained `LTXVAddGuide`. Lives in Kijai's fork, not the official Lightricks repo.
+**Widgets.** One row per anchor.
+
+#### `LTXVLatentUpsampler`
+
+**What it does.** Upsamples the stage-1 video latent by 2× using a trained spatial upscaler model (e.g., `ltx-2.3-spatial-upscaler-x2-1.1`).
+**Why it's needed.** Two-stage rendering — generate at half resolution for speed/VRAM, then upsample and refine at full resolution. Runs in **latent space**, not pixels, so it understands video structure rather than just interpolating pixels.
+**Effect on video.** Doubles spatial resolution (768×512 → 1536×1024). Because the stage-1 latent wasn't fully denoised (`LTXVScheduler.terminal=0.1`), the upsampled latent has headroom for a stage-2 refinement pass to add true detail — **not** just blurry upscaling.
+**Widgets.** `upscaler` (model input), `scale` (2×).
+
+#### `LatentUpscaleModelLoader`
+
+**What it does.** Loads the spatial or temporal latent upscaler checkpoint from `models/latent_upscale_models/`.
+**Why it's needed.** `LTXVLatentUpsampler` needs a loaded upscaler model as input. Spatial upscaler doubles resolution; temporal upscaler doubles frame count (optional, for very smooth output).
+**Effect on video.** Model choice determines upscale quality. Use the matching version (LTX-2.3 upscalers with LTX-2.3 backbone).
+**Widgets.** `model_name`.
+
+#### `LTXVCropGuides`
+
+**What it does.** After `LTXVLatentUpsampler`, trims the IC-LoRA / conditioning guide latents back to match the upsampled spatial/frame size.
+**Why it's needed.** IC-LoRAs are trained at `ref_downscale=0.5` — the guide latent is at half the resolution of the output. After stage-2 upsampling, guides and the main latent disagree on size, which breaks the attention masks. This node auto-aligns them.
+**Effect on video.** Essential if you use IC-LoRAs with two-stage rendering — without it, structural guidance (depth/Canny/pose) stops tracking correctly in stage 2. No effect (and safe to omit) when not using IC-LoRAs.
+**Widgets.** None (reads shapes automatically).
+
+#### `LTXVTiledVAEDecode`
+
+**What it does.** LTX-specific tiled VAE decode — like the generic `VAEDecodeTiled` but tuned to LTX-2.3's VAE. Widgets are in **latent tiles** (not pixels).
+**Why it's needed.** LTX-2.3's VAE decode is VRAM-hungry at full resolution. This node tiles along latent space — fewer pixel-level artifacts than naive pixel-tiled decode, and aware of LTX's temporal stride.
+**Effect on video.** Smaller `tile_height` / `tile_width` / `overlap` → lower VRAM, slower, more visible seams if overlap is too low. `decode_method="auto"` picks the best strategy for the loaded VAE. See §9.8 for safe 12 GB values and the shipped two-stage defaults.
+**Widgets.** `tile_height`, `tile_width`, `overlap`, `force_input_latent`, `decode_method` (`auto`), `upscale_method` (`auto`).
+
+#### `LTXVAudioVAEDecode`
+
+**What it does.** Decodes the audio latent into a playable `AUDIO` stream.
+**Why it's needed.** LTX-2.3's audio is stored as latent features alongside the video latent; this node reconstructs waveform audio. Feeds `VHS_VideoCombine`'s `audio` input.
+**Effect on video.** None on video; produces the audio track. Audio quality is model-fixed (ambient/cinematic; no lyrics or musical keys — §9.11).
+**Widgets.** None.
 
 ---
 
 ### 12.8 LTX-2.3 IC-LoRA and structural control
 
-| Node | Purpose | Key widgets |
-|------|---------|-------------|
-| `LTXICLoRALoaderModelOnly` | Loads an IC-LoRA and exposes its `ref_downscale_factor`. | `lora_name`, `strength_model`. Outputs `MODEL` and `downscale_factor` — wire the latter to the guide node below. |
-| `LTXAddVideoICLoRAGuide` | Attaches a preprocessed guide video (depth / Canny / pose / motion-track) to conditioning. | `positive` / `negative` (conditioning), `vae`, `guide_video`, `downscale_factor`. |
-| `LTX Add Video IC-LoRA Guide Advanced` | Same as above plus spatial / attention masking. | Adds `attention_strength`, `attention_mask`. |
-| `LTXVDrawTracks` | Editor canvas for drawing sparse motion vectors. | Interactive widget. |
-| `LTXVSparseTrackEditor` | Companion to `LTXVDrawTracks` — edits/refines motion tracks. | Interactive widget. |
+#### `LTXICLoRALoaderModelOnly`
+
+**What it does.** Loads an IC-LoRA ("in-context" LoRA) and exposes its `ref_downscale_factor` as a second output alongside the patched `MODEL`.
+**Why it's needed.** IC-LoRAs were trained with a specific reference downscale factor (encoded in the filename as `ref0.5`). The `LTXAddVideoICLoRAGuide` node needs that factor to resize the guide video correctly. Using a plain `LoraLoaderModelOnly` → the factor isn't extracted → guide mismatch → weak or broken structural control.
+**Effect on video.** `strength_model ↑` → stronger structural lock (depth/pose/edges constrain generation more rigidly); `↓` → more creative freedom but weaker adherence to the guide. Typical: 1.0 for Union-Control, tune down to 0.7–0.8 when combining with another style LoRA.
+**Widgets.** `lora_name`, `strength_model`.
+
+#### `LTXAddVideoICLoRAGuide`
+
+**What it does.** Attaches a **preprocessed guide video** (depth maps / Canny edges / pose skeletons / motion-track lines) to the conditioning tensor. Every frame of the guide video constrains the corresponding generated frame.
+**Why it's needed.** This is what turns an IC-LoRA into actual motion / structure control. Without it, the IC-LoRA is loaded but has no reference to guide against — it produces essentially normal output.
+**Effect on video.** The guide video determines *where things go* — depth controls spatial layout per frame, Canny controls edge structure, pose controls body skeleton, motion-track controls camera trajectory. The model fills in texture, style, and detail from the text prompt, but composition and motion track the guide.
+**Widgets.** `positive` / `negative` (conditioning), `vae`, `guide_video`, `downscale_factor`.
+
+#### `LTX Add Video IC-LoRA Guide Advanced`
+
+**What it does.** Same behavior as the basic guide node, plus **attention strength** and an optional **attention mask** for spatially-localized control.
+**Why it's needed.** Sometimes you only want IC-LoRA control in part of the frame — e.g., depth constraint only on the foreground subject, not the sky. The mask lets you restrict where the guide applies.
+**Effect on video.** `attention_strength ↑` → stronger guide influence within the mask; `attention_mask` (image) → white regions apply the guide, black regions ignore it. Without a mask, behavior matches the basic node.
+**Widgets.** All from basic node plus `attention_strength`, `attention_mask`.
+
+#### `LTXVDrawTracks`
+
+**What it does.** Interactive canvas where you **draw sparse motion vectors** by hand — arrows indicating where specific points should move over the clip.
+**Why it's needed.** For motion-track IC-LoRA, the "guide" isn't a depth/Canny preprocessor — it's hand-drawn motion intent. This node is how you author that intent without needing a reference video.
+**Effect on video.** Arrows you draw become motion paths in the generated video. Sparse tracks (a few arrows) → broad motion guidance; dense tracks → precise choreography. Best for enforcing specific camera paths or character movement.
+**Widgets.** Interactive canvas.
+
+#### `LTXVSparseTrackEditor`
+
+**What it does.** Companion editor to `LTXVDrawTracks` — refines, deletes, and repositions individual tracks after initial drawing.
+**Why it's needed.** Drawing perfect tracks in one pass is rare; this lets you iterate without redrawing everything.
+**Effect on video.** Same as `LTXVDrawTracks` — the edited tracks become the motion guide.
+**Widgets.** Interactive editor.
 
 **Preprocessors (generic, from `comfyui_controlnet_aux` / `ComfyUI-VideoDepthAnything`):**
 
-| Node | Produces | Key widgets |
-|------|----------|-------------|
-| `VideoDepthAnythingProcess` + `LoadVideoDepthAnythingModel` | Depth video for IC-LoRA Union. | Model variant (`vits`, `vitb`, `vitl`), input resolution. |
-| `CannyEdgePreprocessor` | Canny edge video. | `low_threshold` (↓ = more edges, more noise), `high_threshold`. |
-| `DWPreprocessor` | OpenPose skeleton video. | `detect_hand`, `detect_body`, `detect_face`. |
-| `ResizeImageMaskNode` (KJNodes) | Resizes image/mask to match latent. | `width`, `height`, `upscale_method`. |
+#### `VideoDepthAnythingProcess` + `LoadVideoDepthAnythingModel`
+
+**What it does.** Runs a video through Depth Anything to produce a per-frame depth map video (grayscale, near = bright, far = dark).
+**Why it's needed.** Depth is one of the three cue types used by the Union IC-LoRA. You feed a reference video of real motion, Depth Anything extracts depth per frame, and the IC-LoRA uses that depth stack to constrain spatial layout in the generated video.
+**Effect on video.** Output preserves the depth/spatial layout of the reference but allows the model to paint any surface texture / style on top. Model variant: `vits` (fastest, roughest), `vitb` (balanced), `vitl` (slowest, most accurate). Higher input resolution → sharper depth edges, higher VRAM.
+**Widgets.** Model variant, input resolution.
+
+#### `CannyEdgePreprocessor`
+
+**What it does.** Runs Canny edge detection per frame, producing a black/white edge-map video.
+**Why it's needed.** Canny is one of the three Union IC-LoRA cue types — it pins the edge structure (object outlines, silhouettes) while leaving fill/style to the prompt. Good for preserving the exact composition of a reference while restyling it.
+**Effect on video.** `low_threshold ↓` → more edges detected (more detail preserved, but noisier); `high_threshold ↑` → cleaner edges, fewer false positives. Typical: `(100, 200)` for clean references, `(50, 150)` for noisy footage.
+**Widgets.** `low_threshold`, `high_threshold`.
+
+#### `DWPreprocessor`
+
+**What it does.** Runs DWPose (a fast, accurate pose estimator) per frame, producing a skeleton-overlay video.
+**Why it's needed.** Pose is the third Union IC-LoRA cue — it constrains body/character poses per frame, letting you transfer choreography from a reference dancer to your generated character.
+**Effect on video.** `detect_body=True` → full-body skeleton (required for pose IC-LoRA). `detect_hand=True` → adds finger joints (only helps if your model handles hands well; LTX-2.3 is weak at hands — §11.7). `detect_face=True` → facial keypoints (usually overkill; leave off).
+**Widgets.** `detect_hand`, `detect_body`, `detect_face`.
+
+#### `ResizeImageMaskNode` (KJNodes)
+
+**What it does.** Resizes an image or mask to a target resolution using a chosen interpolation method.
+**Why it's needed.** Anchor images (`LTXVAddGuide`) and guide videos must match the latent's spatial dimensions; otherwise you get shape errors or distortion. This is the standard resizer in LTX workflows.
+**Effect on video.** `upscale_method="lanczos"` → sharpest result for upscales; `"bilinear"` → smoother, less ringing; `"nearest"` → pixel-art / hard edges. Wrong method on an anchor image can visibly bleed into the generated first frame.
+**Widgets.** `width`, `height`, `upscale_method`.
 
 ---
 
