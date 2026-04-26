@@ -421,7 +421,7 @@ SamplerCustomAdvanced (NOISE, GUIDER, SAMPLER, SIGMAS, AV latent)
 frames + AUDIO + fps ──▶ VHS_VideoCombine  (or CreateVideo)
 ```
 
-**Stage 2 (recommended for full-quality 2× output):** take the stage-1 video latent → `LatentUpscaleModelLoader` (loads `ltx-2.3-spatial-upscaler-x2-1.1`) → `LTXVLatentUpsampler` → second `SamplerCustomAdvanced` (steps=3–4, CFG=1.0, distilled LoRA active) → `LTXVTiledVAEDecode`. The upscaler ingests the **non-fully-denoised** latent (that's why §9.7's `LTXVScheduler.terminal=0.1` matters — it leaves headroom for the second pass).
+**Stage 2 (recommended for full-quality 2× output):** take the stage-1 video latent → `LatentUpscaleModelLoader` (loads `ltx-2.3-spatial-upscaler-x2-1.1`) → `LTXVLatentUpsampler` → second `SamplerCustomAdvanced` with `ManualSigmas(0.909375, 0.725, 0.421875, 0.0)` (the distilled schedule's tail — 3 steps), `CFGGuider cfg=1.0`, distilled LoRA active → `LTXVTiledVAEDecode`. Stage 2 uses `ManualSigmas`, **not** `LTXVScheduler` — the upscaled latent sits near sigma 0.909, so the sampler walks the last 4 sigmas of the distilled curve (see §9.7).
 
 **`CFGGuider` vs `MultimodalGuider`:**
 - `CFGGuider` — single CFG scalar, video-only (or distilled where CFG is off). Used in two-stage distilled detail passes (typically `cfg=1`).
@@ -476,35 +476,40 @@ For longer than ~10s use `LTXVLoopingSampler` (§10.5) — VRAM grows roughly li
 
 ### 9.7 Sampler / scheduler presets
 
-**Terminology first.** "Distilled" is a **sampling mode** — few steps + `CFGGuider cfg=1.0` + distilled LoRA active — **not** a scheduler. It appears in two shipped templates, which behave differently:
+**Terminology first.** "Distilled" is a **weight + guidance technique**, not a scheduler choice: distilled LoRA active on MODEL + `CFGGuider cfg=1.0` lets the sampler converge in very few steps. The **distilled LoRA is active in both shipped 2.3 workflows** — single-stage and two-stage. What differs between them is only **how many sampler calls** exist and **which sigmas each sampler receives**.
 
-- **`Single_Stage_Distilled_Full.json`** — distilled mode for the whole render. Uses `ManualSigmas` (8 hard-coded sigmas), which **replaces** `LTXVScheduler`.
-- **`Two_Stage_Distilled.json`** — `LTXVScheduler` in **both** stages. Stage 1 is the full 20-step dev pass ending at `terminal=0.1`; stage 2 runs the distilled mode (3–4 steps, CFG=1, distilled LoRA on) on the 2×-upscaled latent to finish the remaining ~10% of denoise. `ManualSigmas` is **not** used here — `LTXVScheduler` just runs for fewer steps.
+- **`Single_Stage_Distilled_Full.json`** — one `SamplerCustomAdvanced`. `ManualSigmas` holds the full 9-value distilled schedule (1.0 → 0). Entire denoise is one pass at one resolution.
+- **`Two_Stage_Distilled.json`** (and the official T2V template) — two `SamplerCustomAdvanced` calls with `LTXVLatentUpsampler` between them.
+  - **Stage 1** runs a full-noise dev pass: `LTXVScheduler` (20 steps), `MultimodalGuider` (scale ~28). Not distilled mode — this stage uses the full guidance.
+  - **Stage 2** runs the distilled tail: `ManualSigmas(0.909375, 0.725, 0.421875, 0.0)` — the **last 4 sigmas of the distilled schedule** — with `CFGGuider cfg=1.0`. 3 effective steps on the 2×-upscaled latent.
 
-So the right mental model is: distilled mode is a *fast refinement primitive*. Run it standalone (single stage, `ManualSigmas`) for speed, or as stage 2 (`LTXVScheduler`, 3–4 steps) after a full-quality stage 1.
+Why the stage-2 sigmas start at 0.909 and not near 0: the distilled 9-sigma curve has 5 tiny warm-up steps (1.0 → 0.975) followed by 4 big denoising steps (0.975 → 0). The upscaled latent out of `LTXVLatentUpsampler` sits near the "post-warm-up" state, so stage 2 skips the warm-up and runs only the meaningful tail.
 
-| Stage | Steps | CFG | Sampler | Notes |
-|-------|-------|-----|---------|-------|
-| Dev, stage 1 | 20 (up to 25–35) | 4.0 (range 2–5) on `MultimodalGuider` (or `scale=28` per template) | `euler` / `euler_ancestral` | `LTXVScheduler` + `LTXVNormalizingSampler` |
-| Dev, stage 2 (upsample, distilled mode) | 3–4 | 1.0 (`CFGGuider`) | `euler` | `LTXVScheduler` (short run), distilled LoRA active |
-| Single-stage distilled | 8 | 1.0 (`CFGGuider`) | `euler` | `ManualSigmas` (see below), replaces `LTXVScheduler` |
+| Graph | Sampler calls | Stage-1 sigmas | Stage-2 sigmas | Stage-1 guider | Stage-2 guider | Distilled LoRA |
+|-------|---------------|----------------|----------------|----------------|----------------|----------------|
+| Single-stage distilled | 1 | `ManualSigmas` full 9 values | — | `CFGGuider cfg=1.0` | — | active |
+| Two-stage (official T2V) | 2 + upsampler | `LTXVScheduler` (20 steps, full noise) | `ManualSigmas(0.909375, 0.725, 0.421875, 0.0)` — 3 steps | `MultimodalGuider scale≈28` | `CFGGuider cfg=1.0` | active |
 
-**`LTXVScheduler` parameter meaning:**
+**`LTXVScheduler` parameter meaning** (used for stage 1 of two-stage; the full distilled schedule in single-stage is hard-coded in `ManualSigmas` instead):
 
 | Param | Default | Effect when raised |
 |-------|---------|---------------------|
 | `max_shift` | 2.05 | Pushes schedule toward noisier sigmas at start → stronger global motion, looser structure |
 | `base_shift` | 0.95 | Tilts the whole curve toward higher noise; lower it for a more linear flow-matching curve |
 | `stretch` | True | If True, rescales sigmas so the schedule terminates at `terminal` instead of ~0 |
-| `terminal` | 0.1 | Cutoff sigma; denoising stops here, leaving headroom for stage-2 refinement. Lower = cleaner stage-1; higher = more detail headroom |
+| `terminal` | 0.1 | Cutoff sigma; denoising stops here. For stage 1 of two-stage, leave near default — the upsampler and stage-2 `ManualSigmas` tail cover the remainder |
 
-**The single-stage distilled workflow uses `ManualSigmas` instead of `LTXVScheduler`** (two-stage distilled keeps `LTXVScheduler` in both stages — see the terminology note at the start of this section). The shipped 2.3 single-stage distilled JSON hard-codes:
+**Exact sigma lists shipped in the JSONs:**
 
 ```
-sigmas = "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
+Single-stage distilled (9 sigmas, 8 steps):
+  1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0
+
+Two-stage stage 2 (4 sigmas, 3 steps) — the tail of the above:
+                                         0.909375, 0.725, 0.421875, 0.0
 ```
 
-(8 effective steps + terminal 0.) Swap the node if you want different distilled behavior; the schedule is **not** baked into the model.
+The schedule is **not** baked into the model — `ManualSigmas` is a node with a text widget. Change the values if you want different behavior, but the shipped lists are what the distilled LoRA was trained to denoise against.
 
 ### 9.8 VRAM tiers (LTX-2.3 22B)
 
@@ -578,7 +583,7 @@ Concrete settings to drop into a fresh `Two_Stage_Distilled.json`:
 | FPS | 25 (`LTXVConditioning.frame_rate=25`, `VideoCombine.fps=25`) |
 | Stage-1 sampler | `euler`, steps=20, `LTXVScheduler` defaults, `MultimodalGuider scale=28` |
 | Spatial upscaler | `ltx-2.3-spatial-upscaler-x2-1.1.safetensors` → 1536×1024 |
-| Stage-2 sampler | `euler`, steps=4, `CFGGuider cfg=1.0` |
+| Stage-2 sampler | `euler`, `ManualSigmas(0.909375, 0.725, 0.421875, 0.0)` (3 steps, distilled tail), `CFGGuider cfg=1.0` |
 | VAE decode | `LTXVTiledVAEDecode (2, 2, 6, false, auto, auto)` |
 | Positive prompt | (your scene + sound description, see §9.11) |
 | Negative prompt | `pc game, console game, video game, cartoon, childish, ugly` |
@@ -1247,15 +1252,21 @@ All of these require `ComfyUI-LTXVideo`.
 #### `LTXVScheduler`
 
 **What it does.** Emits the sigma schedule (noise-level curve the sampler walks down) tuned specifically for LTX-2.3's flow-matching DiT.
-**Why it's needed.** LTX-2.3 is trained on a *shifted* flow-matching schedule — not the DDPM-style schedules `BasicScheduler` produces. Feeding a generic schedule → model denoises at the wrong rate → blurry, undercooked, oversaturated, or broken frames. Used in both stages of the two-stage workflow (§9.7).
-**Effect on video.** `max_shift ↑` → curve pushes toward noisier start → stronger global motion, looser spatial structure. `base_shift ↑` → curve tilts to noisier overall (more chaotic detail). `stretch=True` lets the schedule terminate at `terminal` instead of ~0 — this is what leaves room for stage 2. `terminal ↑` → more "undone" noise left for a stage-2 refine pass; `↓` → cleaner standalone render but no stage-2 headroom.
-**Widgets.** `steps` (20 stage-1, 3–4 stage-2), `max_shift` (2.05), `base_shift` (0.95), `stretch` (True), `terminal` (0.1). Full table in §9.7.
+**Why it's needed.** LTX-2.3 is trained on a *shifted* flow-matching schedule — not the DDPM-style schedules `BasicScheduler` produces. Feeding a generic schedule → model denoises at the wrong rate → blurry, undercooked, oversaturated, or broken frames. Used for **stage 1** of the two-stage workflow; stage 2 uses `ManualSigmas` with the distilled tail (see §9.7).
+**Effect on video.** `max_shift ↑` → curve pushes toward noisier start → stronger global motion, looser spatial structure. `base_shift ↑` → curve tilts to noisier overall (more chaotic detail). `stretch=True` lets the schedule terminate at `terminal` instead of ~0. `terminal ↑` → leaves more noise at the end; `↓` → cleaner standalone render.
+**Widgets.** `steps` (20 for stage 1 of two-stage, or single-stage non-distilled), `max_shift` (2.05), `base_shift` (0.95), `stretch` (True), `terminal` (0.1). Full table in §9.7.
 
 #### `ManualSigmas`
 
 **What it does.** Hard-codes a fixed list of sigmas — a literal noise schedule — instead of generating one algorithmically.
-**Why it's needed.** The **single-stage distilled** LTX-2.3 workflow was trained against a *specific* 8-point sigma schedule. The distilled LoRA expects exactly those values — using `LTXVScheduler` instead produces the wrong noise trajectory, and the distilled LoRA fights the sampler, giving muddy / broken output. `ManualSigmas` pins the schedule to the exact values the LoRA was trained with. **Only used in single-stage distilled mode;** the two-stage distilled workflow keeps `LTXVScheduler` in both stages.
-**Effect on video.** With the shipped values (`1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0`), you get the canonical 8-step distilled render — fast (~8s on a 4090) and clean. Shorter sigma lists → even faster but coarser motion and softer detail. Longer lists → diminishing returns; the distilled LoRA saturates above ~12 steps.
+**Why it's needed.** The distilled LoRA was trained against *specific* sigma values, and `ManualSigmas` pins the schedule to exactly those values — `LTXVScheduler`'s algorithmic curve doesn't hit them precisely, and the LoRA fights the sampler, giving muddy output. Used in **two** places:
+- **Single-stage distilled workflow:** full 9-value schedule (1.0 → 0), 8 steps total.
+- **Stage 2 of two-stage workflow:** distilled **tail only** (4 values, 3 steps) — the upscaled latent sits near sigma 0.909, so stage 2 walks the last 4 sigmas of the same distilled curve.
+
+**Effect on video.** Shipped sigma lists:
+- Single-stage: `1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0` — 8 steps, canonical distilled render (~8s on a 4090).
+- Two-stage stage 2: `0.909375, 0.725, 0.421875, 0.0` — 3 steps (~3s on a 4090), refines 2×-upscaled latent.
+Shorter lists → even faster but coarser motion and softer detail. Longer lists → diminishing returns; the distilled LoRA saturates above ~12 steps. Don't put the full 1.0→0 list in stage 2 — it treats the upscaled latent as pure noise and discards stage 1's work.
 **Widgets.** `sigmas` — comma-separated floats.
 
 #### `MultimodalGuider`

@@ -421,7 +421,7 @@ SamplerCustomAdvanced (NOISE, GUIDER, SAMPLER, SIGMAS, AV latent)
 frames + AUDIO + fps ──▶ VHS_VideoCombine  (или CreateVideo)
 ```
 
-**Stage 2 (рекомендуется для полного 2× качества):** возьмите stage-1 video latent → `LatentUpscaleModelLoader` (загружает `ltx-2.3-spatial-upscaler-x2-1.1`) → `LTXVLatentUpsampler` → второй `SamplerCustomAdvanced` (steps=3–4, CFG=1.0, distilled LoRA активна) → `LTXVTiledVAEDecode`. Апскейлер принимает **не до конца дешумленный** латент (поэтому в §9.7 параметр `LTXVScheduler.terminal=0.1` важен — он оставляет запас для второго прохода).
+**Stage 2 (рекомендуется для полного 2× качества):** возьмите stage-1 video latent → `LatentUpscaleModelLoader` (загружает `ltx-2.3-spatial-upscaler-x2-1.1`) → `LTXVLatentUpsampler` → второй `SamplerCustomAdvanced` с `ManualSigmas(0.909375, 0.725, 0.421875, 0.0)` (хвост distilled-расписания — 3 шага), `CFGGuider cfg=1.0`, distilled-LoRA активна → `LTXVTiledVAEDecode`. Stage 2 использует `ManualSigmas`, **а не** `LTXVScheduler` — апскейленный латент находится около sigma 0.909, и семплер проходит последние 4 sigmas distilled-кривой (см. §9.7).
 
 **`CFGGuider` vs `MultimodalGuider`:**
 - `CFGGuider` — единый CFG-скаляр, только видео (или distilled, где CFG отключён). Используется в two-stage distilled detail-проходах (обычно `cfg=1`).
@@ -476,35 +476,40 @@ LoadImage ──▶ LTXVPreprocess ──▶ LTXVImgToVideoInplace (strength=1.0
 
 ### 9.7 Sampler / scheduler пресеты
 
-**Сначала термины.** «Distilled» — это **режим семплинга** (мало шагов + `CFGGuider cfg=1.0` + активная distilled-LoRA), **а не** выбор шедулера. Он появляется в двух поставляемых шаблонах, которые ведут себя по-разному:
+**Сначала термины.** «Distilled» — это **техника весов + guidance**, а не выбор шедулера: активная distilled-LoRA на MODEL + `CFGGuider cfg=1.0` позволяют семплеру сходиться за очень малое число шагов. **Distilled-LoRA активна в обоих поставляемых 2.3-воркфлоу** — и single-stage, и two-stage. Различаются они только **числом вызовов семплера** и **какие sigmas получает каждый семплер**.
 
-- **`Single_Stage_Distilled_Full.json`** — distilled-режим на весь рендер. Использует `ManualSigmas` (8 хардкоженных sigmas), который **заменяет** `LTXVScheduler`.
-- **`Two_Stage_Distilled.json`** — `LTXVScheduler` в **обеих** стадиях. Stage 1 — это полный 20-шаговый dev-проход, заканчивающийся на `terminal=0.1`; stage 2 запускает distilled-режим (3–4 шага, CFG=1, distilled-LoRA включена) на 2×-апскейленном латенте, чтобы доделать оставшиеся ~10% денойза. `ManualSigmas` здесь **не** используется — `LTXVScheduler` просто запускается с меньшим числом шагов.
+- **`Single_Stage_Distilled_Full.json`** — один `SamplerCustomAdvanced`. `ManualSigmas` содержит полное 9-значное distilled-расписание (1.0 → 0). Весь denoise — один проход на одном разрешении.
+- **`Two_Stage_Distilled.json`** (и официальный T2V-шаблон) — два вызова `SamplerCustomAdvanced` с `LTXVLatentUpsampler` между ними.
+  - **Stage 1** — полный dev-проход от полного шума: `LTXVScheduler` (20 шагов), `MultimodalGuider` (scale ~28). Это **не** distilled-режим — здесь работает полный guidance.
+  - **Stage 2** — distilled-хвост: `ManualSigmas(0.909375, 0.725, 0.421875, 0.0)` — **последние 4 sigmas distilled-расписания** — с `CFGGuider cfg=1.0`. 3 эффективных шага на 2×-апскейленном латенте.
 
-Правильная ментальная модель: distilled-режим — это *быстрый примитив доочистки*. Запускайте его standalone (single stage, `ManualSigmas`) для скорости или как stage 2 (`LTXVScheduler`, 3–4 шага) после полноценной stage 1.
+Почему sigmas для stage 2 начинаются с 0.909, а не около 0: distilled-кривая из 9 значений состоит из 5 крошечных «разогревочных» шагов (1.0 → 0.975) и 4 больших шагов денойза (0.975 → 0). Апскейленный латент на выходе `LTXVLatentUpsampler` находится около «пост-разогревочного» состояния, поэтому stage 2 пропускает разогрев и прогоняет только содержательный хвост.
 
-| Стадия | Шаги | CFG | Sampler | Заметки |
-|-------|-------|-----|---------|-------|
-| Dev, stage 1 | 20 (до 25–35) | 4.0 (диапазон 2–5) на `MultimodalGuider` (или `scale=28` по шаблону) | `euler` / `euler_ancestral` | `LTXVScheduler` + `LTXVNormalizingSampler` |
-| Dev, stage 2 (upsample, distilled-режим) | 3–4 | 1.0 (`CFGGuider`) | `euler` | `LTXVScheduler` (короткий прогон), distilled-LoRA активна |
-| Single-stage distilled | 8 | 1.0 (`CFGGuider`) | `euler` | `ManualSigmas` (см. ниже), заменяет `LTXVScheduler` |
+| Граф | Вызовы семплера | Sigmas stage 1 | Sigmas stage 2 | Guider stage 1 | Guider stage 2 | Distilled-LoRA |
+|------|-----------------|----------------|----------------|----------------|----------------|----------------|
+| Single-stage distilled | 1 | `ManualSigmas` полные 9 значений | — | `CFGGuider cfg=1.0` | — | активна |
+| Two-stage (официальный T2V) | 2 + upsampler | `LTXVScheduler` (20 шагов, полный шум) | `ManualSigmas(0.909375, 0.725, 0.421875, 0.0)` — 3 шага | `MultimodalGuider scale≈28` | `CFGGuider cfg=1.0` | активна |
 
-**Значение параметров `LTXVScheduler`:**
+**Значение параметров `LTXVScheduler`** (используется для stage 1 two-stage; полное distilled-расписание в single-stage хардкодится в `ManualSigmas`):
 
 | Параметр | По умолчанию | Эффект при увеличении |
 |-------|---------|---------------------|
 | `max_shift` | 2.05 | Сдвигает расписание к более шумным sigmas в начале → сильнее глобальное движение, рыхлее структура |
 | `base_shift` | 0.95 | Наклоняет всю кривую к большему шуму; снижайте для более линейной flow-matching кривой |
 | `stretch` | True | Если True, перешкаливает sigmas так, чтобы расписание заканчивалось на `terminal` вместо ~0 |
-| `terminal` | 0.1 | Sigma отсечения; denoising останавливается здесь, оставляя запас для stage-2. Ниже = чище stage-1; выше = больше запаса деталей |
+| `terminal` | 0.1 | Sigma отсечения; denoising останавливается здесь. Для stage 1 two-stage оставьте близко к дефолту — апсемплер и `ManualSigmas`-хвост stage 2 добирают остаток |
 
-**Single-stage distilled-воркфлоу использует `ManualSigmas` вместо `LTXVScheduler`** (two-stage distilled оставляет `LTXVScheduler` в обеих стадиях — см. заметку о терминологии в начале раздела). Поставленный 2.3 single-stage distilled JSON хардкодит:
+**Точные списки sigmas, поставляемых в JSON:**
 
 ```
-sigmas = "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
+Single-stage distilled (9 sigmas, 8 шагов):
+  1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0
+
+Two-stage stage 2 (4 sigmas, 3 шага) — хвост вышеуказанного:
+                                         0.909375, 0.725, 0.421875, 0.0
 ```
 
-(8 эффективных шагов + terminal 0.) Поменяйте ноду, если хотите другое distilled-поведение; расписание **не** запечено в модель.
+Расписание **не** запечено в модель — `ManualSigmas` это нода с текстовым виджетом. Меняйте значения, если нужно другое поведение, но поставляемые списки — именно то, на чём distilled-LoRA училась денойзить.
 
 ### 9.8 VRAM-уровни (LTX-2.3 22B)
 
@@ -578,7 +583,7 @@ LTX-2.3 использует **единый общий текстовый про
 | FPS | 25 (`LTXVConditioning.frame_rate=25`, `VideoCombine.fps=25`) |
 | Stage-1 sampler | `euler`, steps=20, `LTXVScheduler` defaults, `MultimodalGuider scale=28` |
 | Spatial upscaler | `ltx-2.3-spatial-upscaler-x2-1.1.safetensors` → 1536×1024 |
-| Stage-2 sampler | `euler`, steps=4, `CFGGuider cfg=1.0` |
+| Stage-2 sampler | `euler`, `ManualSigmas(0.909375, 0.725, 0.421875, 0.0)` (3 шага, distilled-хвост), `CFGGuider cfg=1.0` |
 | VAE decode | `LTXVTiledVAEDecode (2, 2, 6, false, auto, auto)` |
 | Positive prompt | (ваша сцена + описание звука, см. §9.11) |
 | Negative prompt | `pc game, console game, video game, cartoon, childish, ugly` |
@@ -1162,8 +1167,8 @@ Gemma — полноценная LLM; фичи, которых у CLIP нет:
 
 | Нода | Назначение | Ключевые виджеты |
 |------|------------|-------------------|
-| `LTXVScheduler` | Подтюненное LTX sigma-расписание для полного dev-чекпойнта. | `steps` (20 stage-1, 3–4 stage-2), `max_shift` (2.05; ↑ = больше глобального движения, слабее структура), `base_shift` (0.95; ↑ = более шумная кривая в целом), `stretch` (True оставляет `terminal` как конечную сигму), `terminal` (0.1 оставляет запас для stage-2; ↓ = чище stage-1). Полную таблицу см. в §9.7. |
-| `ManualSigmas` | Хардкодит список сигм. Используется distilled 8-step воркфлоу. | `sigmas` — список float через запятую. Шаблонное distilled-расписание в §9.7. |
+| `LTXVScheduler` | Подтюненное LTX sigma-расписание для полного dev-чекпойнта. Используется для **stage 1** two-stage воркфлоу; stage 2 берёт `ManualSigmas` с distilled-хвостом. | `steps` (20 для stage 1 two-stage или single-stage non-distilled), `max_shift` (2.05; ↑ = больше глобального движения, слабее структура), `base_shift` (0.95; ↑ = более шумная кривая в целом), `stretch` (True оставляет `terminal` как конечную сигму), `terminal` (0.1). Полную таблицу см. в §9.7. |
+| `ManualSigmas` | Хардкодит список сигм. Используется в **двух** местах: (а) single-stage distilled — полная кривая 9 значений (1.0 → 0), 8 шагов; (б) stage 2 two-stage — хвост 4 значений `0.909375, 0.725, 0.421875, 0.0`, 3 шага. | `sigmas` — список float через запятую. Не подставляйте полный 1.0→0 список в stage 2 — это обесценит stage 1. Шаблоны в §9.7. |
 | `MultimodalGuider` | AV-aware guider с per-modality шкалами и STG. **Обязателен** для генерации video+audio. | `scale` (28 в поставляемом шаблоне, трактуется как «CFG-эквивалент»), `skip_block_indices` (список STG-слоёв), `stg_scale`, `rescale`. Дефолты официально не задокументированы — стартуйте от JSON-шаблона. |
 | `STGGuiderAdvanced` | Вариант `MultimodalGuider`, необходимый для `LTXVLoopingSampler`. | Та же идея плюс продвинутые STG-крутилки. |
 | `LTXVNormalizingSampler` | Оборачивает другой `SAMPLER`, предотвращая overbake латента на высоком CFG. | `sampler` (вход). Используйте только на stage-1; пропускайте на inpaint/extend. |
